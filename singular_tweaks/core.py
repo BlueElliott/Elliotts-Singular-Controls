@@ -1,5 +1,5 @@
 from . import __version__
-# ...existing code...
+
 import os, time, re, requests
 from typing import List, Dict, Any, Optional
 from urllib.parse import quote
@@ -12,6 +12,9 @@ from contextlib import asynccontextmanager
 from fastapi.routing import APIRoute
 
 # ================== 1. CONFIG & GLOBALS ==================
+# Default port for the HTTP server (can be overridden by env var SINGULAR_TWEAKS_PORT)
+DEFAULT_PORT = int(os.getenv("SINGULAR_TWEAKS_PORT", "3113"))
+
 # 1.1 Runtime configuration model
 # Values can come from environment variables or be set at runtime via HTTP.
 
@@ -575,9 +578,6 @@ def sub_timecontrol(
     r = ctrl_patch([{"subCompositionId": sid, "payload": payload}])
     return {"status": r.status_code, "id": sid, "sent": payload, "response": r.text}
 
-
-# ================== 5. SIMPLE HTML UI ==================
-# A very small, dependency-free page to configure tokens and keys.
 # ================== 5. SIMPLE HTML UI ==================
 # A very small, dependency-free page to configure tokens and keys.
 @app.get("/", response_class=HTMLResponse)
@@ -614,12 +614,29 @@ def index():
             padding: 4px 10px;
             border-radius: 999px;
             font-size: 12px;
-            opacity: 0.8;
+            opacity: 0.9;
+          }}
+          .nav {{
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            font-size: 13px;
+          }}
+          .nav a {{
+            color: #06f;
+            text-decoration: none;
+            margin-right: 8px;
           }}
         </style>
       </head>
       <body>
-        <div class="version-badge">v{__version__}</div>
+        <div class="nav">
+          <a href="/">Home</a>
+          <a href="/settings">Settings</a>
+          <a href="/docs">API docs</a>
+        </div>
+
+        <div class="version-badge">v{__version__} • port {DEFAULT_PORT}</div>
 
         <h1>Singular Tweaks</h1>
         <p>Configure your <strong>Singular Control App</strong>, optional <strong>Data Stream</strong>, and <strong>TfL</strong> API keys.</p>
@@ -696,6 +713,7 @@ def index():
     """
 
 
+
 # ================== 5.1 HELP (JSON) ==================
 @app.get("/help")
 def help_index():
@@ -730,6 +748,8 @@ def help_index():
 if __name__ == "__main__":
     import uvicorn
 
-    logger.info("Starting FastAPI server on http://0.0.0.0:8000 ...")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-# ...existing code...
+    port = DEFAULT_PORT
+    logging.getLogger(__name__).info(
+        "Starting FastAPI server on http://0.0.0.0:%s ...", port
+    )
+    uvicorn.run(app, host="0.0.0.0", port=port)
