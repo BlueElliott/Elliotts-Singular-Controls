@@ -1,4 +1,4 @@
-from . import __version__
+from singular_tweaks import __version__
 
 import os, time, re, requests
 from typing import List, Dict, Any, Optional
