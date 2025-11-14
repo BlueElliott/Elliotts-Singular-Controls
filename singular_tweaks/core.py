@@ -347,16 +347,21 @@ class SettingsIn(BaseModel):
 
 def _nav_html() -> str:
     show_integrations = CONFIG.enable_tfl or CONFIG.enable_datastream
-    return (
-        '<div class="nav">'
-        '<a href="/">Home</a>'
-        '<a href="/commands">Commands</a>'
-        f'{"<a href=\"/integrations\">Integrations</a>" if show_integrations else ""}'
-        '<a href="/settings">Settings</a>'
-        '<a href="/docs">API docs</a>'
-        "</div>"
+    parts = [
+        '<div class="nav">',
+        '<a href="/">Home</a>',
+        '<a href="/commands">Commands</a>',
+    ]
+    if show_integrations:
+        parts.append('<a href="/integrations">Integrations</a>')
+    parts.extend(
+        [
+            '<a href="/settings">Settings</a>',
+            '<a href="/docs">API docs</a>',
+            "</div>",
+        ]
     )
-
+    return "".join(parts)
 
 def _base_style() -> str:
     return """
