@@ -29,7 +29,7 @@ def _app_root() -> Path:
 def _runtime_version() -> str:
     """
     Try to read version from version.txt next to the app.
-    Fallback to 'dev' if not present.
+    Fallback to '1.0.8' if not present.
     """
     try:
         vfile = _app_root() / "version.txt"
@@ -40,7 +40,7 @@ def _runtime_version() -> str:
             return text
     except Exception:
         pass
-    return "1.0.1"
+    return "1.0.8"
 
 
 # ================== 1. CONFIG & GLOBALS ==================
