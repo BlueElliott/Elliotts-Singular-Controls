@@ -2,15 +2,21 @@
 from PyInstaller.utils.hooks import get_module_collection_mode
 from PyInstaller.building.api import EXE, PYZ, Analysis
 
+import os
+
+# Build data files list
+datas = []
+if os.path.exists('static'):
+    datas.append(('static', 'static'))
+if os.path.exists('README.md'):
+    datas.append(('README.md', '.'))
+
 a = Analysis(
     ['singular_tweaks/__main__.py'],
     pathex=[],
     binaries=[],
-    datas=[
-    ('static', 'static'),  # ✅ static/ is in root, not in singular_tweaks/
-    ('README.md', '.'),
-],
-    hiddenimports=['uvicorn.logging', 'fastapi'],
+    datas=datas,
+    hiddenimports=['uvicorn.logging', 'uvicorn.loops', 'uvicorn.loops.auto', 'uvicorn.protocols', 'uvicorn.protocols.http', 'uvicorn.protocols.http.auto', 'uvicorn.protocols.websockets', 'uvicorn.protocols.websockets.auto', 'uvicorn.lifespan', 'uvicorn.lifespan.on'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
