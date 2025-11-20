@@ -4,7 +4,7 @@ Singular Tweaks - Tools and tweaks for controlling Singular.live
 A helper UI and HTTP API for Singular.live with optional TfL data integration.
 """
 
-__version__ = "1.0.12"
+__version__ = "1.0.13"
 __author__ = "BlueElliott"
 __license__ = "MIT"
 
