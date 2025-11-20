@@ -28,8 +28,8 @@ def _app_root() -> Path:
 
 def _runtime_version() -> str:
     """
-    Try to read version from version.txt next to the app.
-    Fallback to '1.0.8' if not present.
+    Try to read version from version.txt next to the app, then package version.
+    Fallback to '1.0.9' if not present.
     """
     try:
         vfile = _app_root() / "version.txt"
@@ -40,7 +40,13 @@ def _runtime_version() -> str:
             return text
     except Exception:
         pass
-    return "1.0.8"
+    # Try to get version from package
+    try:
+        from singular_tweaks import __version__
+        return __version__
+    except Exception:
+        pass
+    return "1.0.9"
 
 
 # ================== 1. CONFIG & GLOBALS ==================
@@ -103,7 +109,7 @@ def load_config() -> AppConfig:
 def save_config(cfg: AppConfig) -> None:
     try:
         with CONFIG_PATH.open("w", encoding="utf-8") as f:
-            json.dump(cfg.dict(), f, indent=2)
+            json.dump(cfg.model_dump(), f, indent=2)
         logger.info("Saved config to %s", CONFIG_PATH)
     except Exception as e:
         logger.error("Failed to save config file %s: %s", CONFIG_PATH, e)
@@ -539,6 +545,46 @@ def update_settings(settings: SettingsIn):
         "enable_datastream": CONFIG.enable_datastream,
         "theme": CONFIG.theme,
     }
+
+
+@app.get("/config/export")
+def export_config():
+    """Export current configuration as JSON for backup."""
+    return CONFIG.model_dump()
+
+
+@app.post("/config/import")
+def import_config(config_data: Dict[str, Any]):
+    """Import configuration from JSON backup."""
+    try:
+        # Update CONFIG with imported data
+        if "singular_token" in config_data:
+            CONFIG.singular_token = config_data["singular_token"]
+        if "singular_stream_url" in config_data:
+            CONFIG.singular_stream_url = config_data["singular_stream_url"]
+        if "tfl_app_id" in config_data:
+            CONFIG.tfl_app_id = config_data["tfl_app_id"]
+        if "tfl_app_key" in config_data:
+            CONFIG.tfl_app_key = config_data["tfl_app_key"]
+        if "enable_tfl" in config_data:
+            CONFIG.enable_tfl = config_data["enable_tfl"]
+        if "enable_datastream" in config_data:
+            CONFIG.enable_datastream = config_data["enable_datastream"]
+        if "theme" in config_data:
+            CONFIG.theme = config_data["theme"]
+        if "port" in config_data:
+            CONFIG.port = config_data["port"]
+
+        # Save to file
+        save_config(CONFIG)
+
+        return {
+            "ok": True,
+            "message": "Configuration imported successfully. Restart app to apply changes.",
+        }
+    except Exception as e:
+        logger.error("Failed to import config: %s", e)
+        raise HTTPException(400, f"Failed to import config: {str(e)}")
 
 
 @app.get("/events")
@@ -1058,6 +1104,14 @@ def settings_page():
     parts.append("</form>")
     parts.append("<p>Config file: <code>" + html_escape(str(CONFIG_PATH)) + "</code></p>")
     parts.append("</fieldset>")
+    # Config Import/Export
+    parts.append("<fieldset><legend>Config Backup</legend>")
+    parts.append("<p>Export your current configuration or import a previously saved config.</p>")
+    parts.append('<button type="button" onclick="exportConfig()">Export Config</button>')
+    parts.append('<input type="file" id="import-file" accept=".json" style="display:none;" onchange="importConfig()" />')
+    parts.append('<button type="button" onclick="document.getElementById(\'import-file\').click()">Import Config</button>')
+    parts.append('<pre id="import-output"></pre>')
+    parts.append("</fieldset>")
     # Updates
     parts.append("<fieldset><legend>Updates</legend>")
     parts.append("<p>Current version: <code>" + _runtime_version() + "</code></p>")
@@ -1102,6 +1156,41 @@ def settings_page():
     parts.append("    out.textContent = msg;")
     parts.append("  } catch (e) {")
     parts.append("    out.textContent = 'Version check failed: ' + e;")
+    parts.append("  }")
+    parts.append("}")
+    parts.append("async function exportConfig() {")
+    parts.append("  try {")
+    parts.append('    const res = await fetch("/config/export");')
+    parts.append("    const config = await res.json();")
+    parts.append("    const blob = new Blob([JSON.stringify(config, null, 2)], { type: 'application/json' });")
+    parts.append("    const url = URL.createObjectURL(blob);")
+    parts.append("    const a = document.createElement('a');")
+    parts.append("    a.href = url;")
+    parts.append("    a.download = 'singular_tweaks_config.json';")
+    parts.append("    a.click();")
+    parts.append("    URL.revokeObjectURL(url);")
+    parts.append('    document.getElementById("import-output").textContent = "Config exported successfully!";')
+    parts.append("  } catch (e) {")
+    parts.append('    document.getElementById("import-output").textContent = "Export failed: " + e;')
+    parts.append("  }")
+    parts.append("}")
+    parts.append("async function importConfig() {")
+    parts.append('  const fileInput = document.getElementById("import-file");')
+    parts.append("  const file = fileInput.files[0];")
+    parts.append("  if (!file) return;")
+    parts.append("  try {")
+    parts.append("    const text = await file.text();")
+    parts.append("    const config = JSON.parse(text);")
+    parts.append('    const res = await fetch("/config/import", {')
+    parts.append('      method: "POST",')
+    parts.append('      headers: { "Content-Type": "application/json" },')
+    parts.append("      body: JSON.stringify(config),")
+    parts.append("    });")
+    parts.append("    const data = await res.json();")
+    parts.append('    document.getElementById("import-output").textContent = data.message || "Config imported!";')
+    parts.append("    setTimeout(() => location.reload(), 2000);")
+    parts.append("  } catch (e) {")
+    parts.append('    document.getElementById("import-output").textContent = "Import failed: " + e;')
     parts.append("  }")
     parts.append("}")
     parts.append("checkUpdates();")
