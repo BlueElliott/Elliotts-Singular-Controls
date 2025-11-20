@@ -3,6 +3,7 @@ GUI Launcher for Singular Tweaks with system tray support.
 """
 import os
 import sys
+import time
 import threading
 import webbrowser
 import tkinter as tk
@@ -317,13 +318,29 @@ class SingularTweaksGUI:
                 bg="#1e1e1e",
                 fg="#d4d4d4",
                 font=("Consolas", 9),
-                relief=tk.FLAT
+                relief=tk.FLAT,
+                wrap=tk.WORD
             )
             console_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+            # Add initial status message
+            port = effective_port()
+            console_text.insert(tk.END, f"Singular Tweaks v{_runtime_version()}\n")
+            console_text.insert(tk.END, "=" * 60 + "\n")
+            if self.server_running:
+                console_text.insert(tk.END, f"✓ Server running on http://0.0.0.0:{port}\n")
+                console_text.insert(tk.END, f"  Access at: http://localhost:{port}\n")
+            else:
+                console_text.insert(tk.END, "⚠ Server not running\n")
+            console_text.insert(tk.END, "=" * 60 + "\n\n")
+            console_text.insert(tk.END, "Console output will appear here...\n\n")
 
             # Redirect stdout to console
             sys.stdout = ConsoleRedirector(console_text)
             sys.stderr = ConsoleRedirector(console_text)
+
+            # Write a test message
+            print(f"[Console] Console window opened at {time.strftime('%H:%M:%S')}")
 
             self.console_toggle_btn.config(text="Close Console")
             self.console_visible = True
