@@ -481,6 +481,49 @@ def get_settings_json():
     }
 
 
+@app.get("/version/check")
+def check_version():
+    """Check for updates against GitHub releases."""
+    current = _runtime_version()
+    try:
+        resp = requests.get(
+            "https://api.github.com/repos/BlueElliott/Singular-Tweaks/releases/latest",
+            timeout=5
+        )
+        if resp.status_code == 404:
+            return {
+                "current": current,
+                "latest": None,
+                "up_to_date": True,
+                "message": "Repository is private or has no public releases",
+            }
+        resp.raise_for_status()
+        data = resp.json()
+        latest = data.get("tag_name", "unknown")
+        release_url = data.get("html_url", "")
+
+        # Normalize versions for comparison (remove 'v' prefix if present)
+        current_normalized = current.lstrip('v')
+        latest_normalized = latest.lstrip('v')
+        up_to_date = current_normalized == latest_normalized
+
+        return {
+            "current": current,
+            "latest": latest,
+            "up_to_date": up_to_date,
+            "release_url": release_url,
+            "message": "You are up to date" if up_to_date else "A newer version is available",
+        }
+    except requests.RequestException as e:
+        logger.error("Version check failed: %s", e)
+        return {
+            "current": current,
+            "latest": None,
+            "up_to_date": True,
+            "message": f"Version check failed: {str(e)}",
+        }
+
+
 @app.post("/settings")
 def update_settings(settings: SettingsIn):
     CONFIG.enable_tfl = settings.enable_tfl
@@ -1044,33 +1087,24 @@ def settings_page():
     parts.append("};")
     parts.append("async function checkUpdates() {")
     parts.append('  const out = document.getElementById("update-output");')
-    parts.append('  out.textContent = "Checking GitHub...";')
+    parts.append('  out.textContent = "Checking for updates...";')
     parts.append("  try {")
-    parts.append('    const owner = "BlueElliott";')
-    parts.append('    const repo = "Singular-Tweaks";')
-    parts.append('    const url = "https://api.github.com/repos/" + owner + "/" + repo + "/releases/latest";')
-    parts.append("    const res = await fetch(url);")
-    parts.append("    if (!res.ok) {")
-    parts.append("      if (res.status === 404) {")
-    parts.append('        out.textContent = "Updates: this repository is private or has no releases visible to the public.";')
-    parts.append("      } else {")
-    parts.append('        out.textContent = "GitHub API error: " + res.status;')
-    parts.append("      }")
-    parts.append("      return;")
-    parts.append("    }")
+    parts.append('    const res = await fetch("/version/check");')
     parts.append("    const data = await res.json();")
-    parts.append("    const latest = data.tag_name || data.name || 'unknown';")
-    parts.append("    const current = '" + _runtime_version() + "';")
-    parts.append("    let msg = 'Current version: ' + current + '\\nLatest release: ' + latest;")
-    parts.append("    if (latest !== current && latest !== 'v' + current) {")
-    parts.append("      msg += '\\n\\nA newer version may be available.';")
-    parts.append("    } else {")
-    parts.append("      msg += '\\n\\nYou are up to date.';")
+    parts.append("    let msg = 'Current version: ' + data.current;")
+    parts.append("    if (data.latest) {")
+    parts.append("      msg += '\\nLatest release: ' + data.latest;")
     parts.append("    }")
-    parts.append("    if (data.html_url) { msg += '\\nRelease page: ' + data.html_url; }")
+    parts.append("    msg += '\\n\\n' + data.message;")
+    parts.append("    if (data.release_url && !data.up_to_date) {")
+    parts.append("      msg += '\\n\\nDownload: ' + data.release_url;")
+    parts.append("    }")
     parts.append("    out.textContent = msg;")
-    parts.append("  } catch (e) { out.textContent = 'Update check failed: ' + e; }")
+    parts.append("  } catch (e) {")
+    parts.append("    out.textContent = 'Version check failed: ' + e;")
+    parts.append("  }")
     parts.append("}")
+    parts.append("checkUpdates();")
     parts.append("</script>")
     parts.append("</body></html>")
     return HTMLResponse("".join(parts))

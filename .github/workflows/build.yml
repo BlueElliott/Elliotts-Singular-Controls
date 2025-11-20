@@ -78,55 +78,56 @@ jobs:
           retention-days: 90
 
   # ==================== BUILD WINDOWS INSTALLER ====================
-  build-windows-installer:
-    name: Build Windows Installer
-    runs-on: windows-latest
-    needs: build-windows-exe
-    if: startsWith(github.ref, 'refs/tags/v')
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download executable
-        uses: actions/download-artifact@v4
-        with:
-          name: windows-executable
-          path: dist/
-
-      - name: Extract version
-        id: version
-        shell: bash
-        run: |
-          VERSION="${{ github.ref_name }}"
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Building installer for version: $VERSION"
-
-      - name: Install NSIS
-        run: choco install nsis -y
-
-      - name: Build installer
-        run: |
-          & "C:\Program Files (x86)\NSIS\makensis.exe" /DVERSION=${{ steps.version.outputs.version }} installer.nsi
-
-      - name: Verify installer exists
-        run: |
-          $installer = "dist\SingularTweaks-Setup-${{ steps.version.outputs.version }}.exe"
-          if (Test-Path $installer) {
-            Write-Host "✓ Installer built successfully"
-            Get-Item $installer | Format-List
-          } else {
-            Write-Error "✗ Installer not found at: $installer"
-            Get-ChildItem dist\ | Format-Table
-            exit 1
-          }
-
-      - name: Upload installer artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-installer
-          path: dist/SingularTweaks-Setup-*.exe
-          retention-days: 90
+  # Installer disabled - using portable EXE only
+  # build-windows-installer:
+  #   name: Build Windows Installer
+  #   runs-on: windows-latest
+  #   needs: build-windows-exe
+  #   if: startsWith(github.ref, 'refs/tags/v')
+  #
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v4
+  #
+  #     - name: Download executable
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: windows-executable
+  #         path: dist/
+  #
+  #     - name: Extract version
+  #       id: version
+  #       shell: bash
+  #       run: |
+  #         VERSION="${{ github.ref_name }}"
+  #         echo "version=$VERSION" >> $GITHUB_OUTPUT
+  #         echo "Building installer for version: $VERSION"
+  #
+  #     - name: Install NSIS
+  #       run: choco install nsis -y
+  #
+  #     - name: Build installer
+  #       run: |
+  #         & "C:\Program Files (x86)\NSIS\makensis.exe" /DVERSION=${{ steps.version.outputs.version }} installer.nsi
+  #
+  #     - name: Verify installer exists
+  #       run: |
+  #         $installer = "dist\SingularTweaks-Setup-${{ steps.version.outputs.version }}.exe"
+  #         if (Test-Path $installer) {
+  #           Write-Host "✓ Installer built successfully"
+  #           Get-Item $installer | Format-List
+  #         } else {
+  #           Write-Error "✗ Installer not found at: $installer"
+  #           Get-ChildItem dist\ | Format-Table
+  #           exit 1
+  #         }
+  #
+  #     - name: Upload installer artifact
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: windows-installer
+  #         path: dist/SingularTweaks-Setup-*.exe
+  #         retention-days: 90
 
   # ==================== BUILD PYTHON PACKAGE ====================
   build-package:
@@ -201,7 +202,7 @@ jobs:
   create-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [build-windows-installer, build-package]
+    needs: [build-windows-exe, build-package]
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
@@ -231,27 +232,24 @@ jobs:
           
           Helper UI and HTTP API for Singular.live with optional TfL data integration.
           
-          ### 📦 Downloads
-          
-          **Windows Users:**
-          - **Installer (Recommended)**: `SingularTweaks-Setup-${{ github.ref_name }}.exe`
-            - Installs to `%LOCALAPPDATA%\SingularTweaks`
-            - Creates desktop and start menu shortcuts
-            - No admin rights required
-          - **Standalone Executable**: `SingularTweaks.exe`
-            - No installation needed
-            - Just download and run
-          
+          ### 📦 Download
+
+          **Download:** `SingularTweaks.exe` (Portable)
+          - No installation needed
+          - Run from any folder
+          - Config saves in the same folder as the EXE
+          - Just download, place it where you want, and run
+
           **Python Users:**
           - Install via pip: `pip install singular-tweaks`
-          - Or download the wheel/tar.gz from [PyPI](https://pypi.org/project/singular-tweaks/)
           
           ### 🚀 Quick Start
-          
-          1. Download the installer or executable
-          2. Run `SingularTweaks.exe`
-          3. Open your browser to `http://localhost:3113`
-          4. Configure your Singular Control App token
+
+          1. Download `SingularTweaks.exe`
+          2. Place it in any folder you want (e.g., Desktop, Documents, etc.)
+          3. Run `SingularTweaks.exe`
+          4. Open your browser to `http://localhost:3113`
+          5. Configure your Singular Control App token
           
           ### 📝 Changelog
           EOF
@@ -275,9 +273,7 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            artifacts/windows-installer/*.exe
-            artifacts/windows-executable/*.exe
-            artifacts/python-package/*
+            artifacts/windows-executable/SingularTweaks.exe
           body_path: release-notes.md
           draft: false
           prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
