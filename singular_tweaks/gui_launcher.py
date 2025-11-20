@@ -42,9 +42,22 @@ def kill_process_on_port(port: int) -> bool:
 class SingularTweaksGUI:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title(f"Singular Tweaks v{_runtime_version()}")
-        self.root.geometry("600x450")
-        self.root.resizable(True, True)
+        self.root.title("Singular Tweaks")
+        self.root.geometry("700x500")
+        self.root.resizable(False, False)
+
+        # Modern dark theme colors (inspired by CUEZ Automator)
+        self.bg_dark = "#1e1e1e"
+        self.bg_medium = "#2b2b2b"
+        self.accent_teal = "#00bcd4"
+        self.text_light = "#ffffff"
+        self.text_gray = "#b0b0b0"
+        self.button_blue = "#3f51b5"
+        self.button_green = "#4caf50"
+        self.button_red = "#f44336"
+        self.button_gray = "#424242"
+
+        self.root.configure(bg=self.bg_dark)
 
         # Icon for system tray
         self.icon = None
@@ -57,140 +70,264 @@ class SingularTweaksGUI:
 
     def create_icon_image(self):
         """Create a simple icon for the system tray."""
-        # Create a 64x64 image with a colored circle
+        # Create a 64x64 image with teal colored circle
         width = 64
         height = 64
-        color1 = "#4da3ff"
-        color2 = "#10141c"
 
-        image = Image.new('RGB', (width, height), color2)
+        image = Image.new('RGB', (width, height), self.bg_dark)
         dc = ImageDraw.Draw(image)
-        dc.ellipse((8, 8, 56, 56), fill=color1)
-        dc.text((22, 22), "ST", fill=color2)
+        dc.ellipse((8, 8, 56, 56), fill=self.accent_teal)
+        dc.text((22, 22), "ST", fill=self.bg_dark)
         return image
 
+    def create_rounded_rectangle(self, canvas, x1, y1, x2, y2, radius=15, **kwargs):
+        """Draw a rounded rectangle on a canvas."""
+        points = [
+            x1+radius, y1,
+            x1+radius, y1,
+            x2-radius, y1,
+            x2-radius, y1,
+            x2, y1,
+            x2, y1+radius,
+            x2, y1+radius,
+            x2, y2-radius,
+            x2, y2-radius,
+            x2, y2,
+            x2-radius, y2,
+            x2-radius, y2,
+            x1+radius, y2,
+            x1+radius, y2,
+            x1, y2,
+            x1, y2-radius,
+            x1, y2-radius,
+            x1, y1+radius,
+            x1, y1+radius,
+            x1, y1
+        ]
+        return canvas.create_polygon(points, **kwargs, smooth=True)
+
     def setup_ui(self):
-        """Setup the main UI."""
-        # Header
-        header_frame = tk.Frame(self.root, bg="#4da3ff", height=60)
-        header_frame.pack(fill=tk.X, padx=0, pady=0)
-        header_frame.pack_propagate(False)
+        """Setup the main UI with modern dark theme."""
+        # Top section with branding
+        top_frame = tk.Frame(self.root, bg=self.bg_dark, height=120)
+        top_frame.pack(fill=tk.X, padx=0, pady=0)
+        top_frame.pack_propagate(False)
 
-        title_label = tk.Label(
-            header_frame,
-            text=f"Singular Tweaks v{_runtime_version()}",
-            font=("Arial", 16, "bold"),
-            bg="#4da3ff",
-            fg="white"
+        # Branding text (simple text logo like CUEZ)
+        brand_label = tk.Label(
+            top_frame,
+            text="SINGULAR\nTWEAKS",
+            font=("Arial", 20, "bold"),
+            bg=self.bg_dark,
+            fg=self.text_light,
+            justify=tk.LEFT
         )
-        title_label.pack(pady=15)
+        brand_label.place(x=30, y=25)
 
-        # Main content frame
-        content_frame = tk.Frame(self.root, bg="#f5f5f5")
-        content_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        # Version badge
+        version_label = tk.Label(
+            top_frame,
+            text=f"v{_runtime_version()}",
+            font=("Arial", 9),
+            bg=self.bg_medium,
+            fg=self.text_gray,
+            padx=8,
+            pady=4
+        )
+        version_label.place(x=30, y=90)
 
-        # Status label
+        # Main content area
+        content_frame = tk.Frame(self.root, bg=self.bg_dark)
+        content_frame.pack(fill=tk.BOTH, expand=True, padx=30, pady=20)
+
+        # Port configuration section (softened edges with relief)
+        port_frame = tk.Frame(content_frame, bg=self.accent_teal, height=80, relief=tk.FLAT, bd=0)
+        port_frame.pack(fill=tk.X, pady=(0, 20))
+        port_frame.pack_propagate(False)
+
+        # Port display and change button
+        port_container = tk.Frame(port_frame, bg=self.accent_teal)
+        port_container.pack(expand=True)
+
+        self.port_label = tk.Label(
+            port_container,
+            text=str(effective_port()),
+            font=("Arial", 24, "bold"),
+            bg=self.accent_teal,
+            fg=self.text_light
+        )
+        self.port_label.pack(side=tk.LEFT, padx=20)
+
+        self.port_change_btn = tk.Button(
+            port_container,
+            text="Change port",
+            command=self.change_port,
+            bg=self.button_blue,
+            fg=self.text_light,
+            font=("Arial", 11),
+            relief=tk.FLAT,
+            cursor="hand2",
+            padx=20,
+            pady=8,
+            bd=0,
+            highlightthickness=0
+        )
+        self.port_change_btn.pack(side=tk.LEFT, padx=10)
+
+        # Status message
         self.status_label = tk.Label(
             content_frame,
-            text="Server Status: Stopped",
+            text="Running all interfaces on port " + str(effective_port()),
             font=("Arial", 11),
-            bg="#f5f5f5",
-            fg="#666"
+            bg=self.bg_dark,
+            fg=self.text_light
         )
-        self.status_label.pack(pady=(0, 15))
+        self.status_label.pack(pady=(0, 5))
 
-        # Buttons frame
-        btn_frame = tk.Frame(content_frame, bg="#f5f5f5")
-        btn_frame.pack(pady=10)
-
-        # Start Server Button
-        self.start_btn = tk.Button(
-            btn_frame,
-            text="▶ Start Server",
-            command=self.start_server,
-            bg="#4da3ff",
-            fg="white",
-            font=("Arial", 11, "bold"),
-            width=15,
-            height=2,
-            relief=tk.FLAT,
-            cursor="hand2"
+        self.url_label = tk.Label(
+            content_frame,
+            text=f"e.g. http://127.0.0.1:{effective_port()}/",
+            font=("Arial", 10),
+            bg=self.bg_dark,
+            fg=self.text_gray
         )
-        self.start_btn.grid(row=0, column=0, padx=5)
+        self.url_label.pack(pady=(0, 20))
 
-        # Launch GUI Button
+        # Action buttons row
+        btn_frame = tk.Frame(content_frame, bg=self.bg_dark)
+        btn_frame.pack(pady=20)
+
+        # Open GUI Button
         self.launch_btn = tk.Button(
             btn_frame,
-            text="🌐 Launch GUI",
+            text="Open GUI",
             command=self.launch_browser,
-            bg="#28a745",
-            fg="white",
-            font=("Arial", 11, "bold"),
-            width=15,
+            bg=self.button_blue,
+            fg=self.text_light,
+            font=("Arial", 11),
+            width=12,
             height=2,
             relief=tk.FLAT,
             cursor="hand2",
-            state=tk.DISABLED
+            state=tk.DISABLED,
+            bd=0,
+            highlightthickness=0
         )
-        self.launch_btn.grid(row=0, column=1, padx=5)
+        self.launch_btn.grid(row=0, column=0, padx=10)
 
-        # Stop Server Button
-        self.stop_btn = tk.Button(
+        # Open Console Button
+        self.console_toggle_btn = tk.Button(
             btn_frame,
-            text="⏹ Stop Server",
-            command=self.stop_server,
-            bg="#dc3545",
-            fg="white",
-            font=("Arial", 11, "bold"),
-            width=15,
+            text="Open Console",
+            command=self.toggle_console,
+            bg=self.button_gray,
+            fg=self.text_light,
+            font=("Arial", 11),
+            width=12,
             height=2,
             relief=tk.FLAT,
             cursor="hand2",
-            state=tk.DISABLED
+            bd=0,
+            highlightthickness=0
         )
-        self.stop_btn.grid(row=0, column=2, padx=5)
+        self.console_toggle_btn.grid(row=0, column=1, padx=10)
 
-        # Toggle Console Button
-        self.console_btn = tk.Button(
-            content_frame,
-            text="▼ Show Console Output",
-            command=self.toggle_console,
-            bg="#6c757d",
-            fg="white",
-            font=("Arial", 10),
+        # Hide Button
+        self.hide_btn = tk.Button(
+            btn_frame,
+            text="Hide",
+            command=self.minimize_to_tray,
+            bg=self.button_gray,
+            fg=self.text_light,
+            font=("Arial", 11),
+            width=12,
+            height=2,
             relief=tk.FLAT,
-            cursor="hand2"
+            cursor="hand2",
+            bd=0,
+            highlightthickness=0
         )
-        self.console_btn.pack(pady=(15, 5))
+        self.hide_btn.grid(row=0, column=2, padx=10)
 
-        # Console output (hidden by default)
-        self.console_frame = tk.Frame(content_frame, bg="#f5f5f5")
-
-        self.console = scrolledtext.ScrolledText(
-            self.console_frame,
-            height=12,
-            bg="#1e1e1e",
-            fg="#d4d4d4",
-            font=("Consolas", 9),
-            relief=tk.FLAT
+        # Quit Button
+        self.quit_btn = tk.Button(
+            btn_frame,
+            text="Quit",
+            command=self.on_closing,
+            bg=self.button_red,
+            fg=self.text_light,
+            font=("Arial", 11),
+            width=12,
+            height=2,
+            relief=tk.FLAT,
+            cursor="hand2",
+            bd=0,
+            highlightthickness=0
         )
-        self.console.pack(fill=tk.BOTH, expand=True)
+        self.quit_btn.grid(row=0, column=3, padx=10)
 
-        # Redirect stdout to console
-        sys.stdout = ConsoleRedirector(self.console)
-        sys.stderr = ConsoleRedirector(self.console)
+        # Console output (hidden by default, will be shown in new window)
+        self.console_window = None
+
+        # Auto-start server on launch
+        self.root.after(500, self.start_server)
+
+    def change_port(self):
+        """Open dialog to change port."""
+        from tkinter import simpledialog
+        new_port = simpledialog.askinteger(
+            "Change Port",
+            "Enter new port number:",
+            initialvalue=effective_port(),
+            minvalue=1024,
+            maxvalue=65535
+        )
+        if new_port and new_port != effective_port():
+            # Update config
+            from singular_tweaks.core import CONFIG, save_config
+            CONFIG.port = new_port
+            save_config(CONFIG)
+
+            # Update UI
+            self.port_label.config(text=str(new_port))
+            self.url_label.config(text=f"e.g. http://127.0.0.1:{new_port}/")
+
+            messagebox.showinfo(
+                "Port Changed",
+                f"Port changed to {new_port}. Please restart the application for changes to take effect."
+            )
 
     def toggle_console(self):
-        """Toggle console visibility."""
-        if self.console_visible:
-            self.console_frame.pack_forget()
-            self.console_btn.config(text="▼ Show Console Output")
-            self.root.geometry("600x300")
+        """Toggle console window visibility."""
+        if self.console_window is None or not tk.Toplevel.winfo_exists(self.console_window):
+            # Create console window
+            self.console_window = tk.Toplevel(self.root)
+            self.console_window.title("Console Output")
+            self.console_window.geometry("800x400")
+            self.console_window.configure(bg=self.bg_dark)
+
+            # Console output
+            console_text = scrolledtext.ScrolledText(
+                self.console_window,
+                bg="#1e1e1e",
+                fg="#d4d4d4",
+                font=("Consolas", 9),
+                relief=tk.FLAT
+            )
+            console_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+            # Redirect stdout to console
+            sys.stdout = ConsoleRedirector(console_text)
+            sys.stderr = ConsoleRedirector(console_text)
+
+            self.console_toggle_btn.config(text="Close Console")
+            self.console_visible = True
         else:
-            self.console_frame.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
-            self.console_btn.config(text="▲ Hide Console Output")
-            self.root.geometry("600x550")
-        self.console_visible = not self.console_visible
+            # Close console window
+            self.console_window.destroy()
+            self.console_window = None
+            self.console_toggle_btn.config(text="Open Console")
+            self.console_visible = False
 
     def start_server(self):
         """Start the server in a background thread."""
@@ -208,8 +345,7 @@ class SingularTweaksGUI:
             else:
                 return
 
-        self.status_label.config(text=f"Server Status: Starting on port {port}...", fg="#ff8c00")
-        self.start_btn.config(state=tk.DISABLED)
+        self.status_label.config(text=f"Starting server on port {port}...")
 
         # Start server in background thread
         self.server_thread = threading.Thread(target=self._run_server, daemon=True)
@@ -252,27 +388,9 @@ class SingularTweaksGUI:
         """Update UI after server starts."""
         port = effective_port()
         self.server_running = True
-        self.status_label.config(
-            text=f"Server Status: Running on http://localhost:{port}",
-            fg="#28a745"
-        )
+        self.status_label.config(text=f"Running all interfaces on port {port}")
+        self.url_label.config(text=f"e.g. http://127.0.0.1:{port}/")
         self.launch_btn.config(state=tk.NORMAL)
-        self.stop_btn.config(state=tk.NORMAL)
-        self.start_btn.config(state=tk.DISABLED)
-
-    def stop_server(self):
-        """Stop the server."""
-        self.server_running = False
-        self.status_label.config(text="Server Status: Stopped", fg="#dc3545")
-        self.launch_btn.config(state=tk.DISABLED)
-        self.stop_btn.config(state=tk.DISABLED)
-        self.start_btn.config(state=tk.NORMAL)
-        # Note: Uvicorn doesn't have a clean shutdown in thread mode
-        # User needs to restart the app to fully stop
-        messagebox.showinfo(
-            "Server Stop",
-            "To fully stop the server, please close and restart the application."
-        )
 
     def launch_browser(self):
         """Open the web GUI in default browser."""

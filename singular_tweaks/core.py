@@ -373,9 +373,10 @@ def _nav_html() -> str:
 def _base_style() -> str:
     theme = CONFIG.theme or "dark"
     if theme == "light":
-        bg = "#f5f5f5"; fg = "#111"; card_bg = "#fff"; border = "#ccc"; accent = "#0af"
+        bg = "#f5f5f5"; fg = "#111"; card_bg = "#fff"; border = "#ccc"; accent = "#00bcd4"
     else:
-        bg = "#05070a"; fg = "#f5f5f5"; card_bg = "#10141c"; border = "#333"; accent = "#4da3ff"
+        # Teal theme matching ITN interface
+        bg = "#1e1e1e"; fg = "#f5f5f5"; card_bg = "#2b2b2b"; border = "#424242"; accent = "#00bcd4"
 
     lines = []
     lines.append("<style>")
@@ -396,7 +397,7 @@ def _base_style() -> str:
     lines.append("  label { display:block; margin-top:0.5rem; }")
     lines.append(
         f"  input, select {{ width:100%; padding:0.35rem 0.5rem; box-sizing:border-box;"
-        f" background:#181c26; color:{fg}; border:1px solid {border}; border-radius: 3px; }}"
+        f" background:{card_bg}; color:{fg}; border:1px solid {border}; border-radius: 3px; }}"
     )
     lines.append(
         f"  button {{ margin-top:0.75rem; padding:0.4rem 0.8rem; cursor:pointer;"
@@ -415,7 +416,7 @@ def _base_style() -> str:
     lines.append("  .nav a:hover { text-decoration: underline; }")
     lines.append("  table { border-collapse:collapse; width:100%; margin-top:0.5rem; }")
     lines.append(f"  th, td {{ border:1px solid {border}; padding:6px 8px; font-size:13px; }}")
-    lines.append("  th { background:#222; color:#fff; text-align: left; }")
+    lines.append(f"  th {{ background:{accent}; color:#fff; text-align: left; }}")
     lines.append(
         "  code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,"
         ' "Liberation Mono", "Courier New", monospace; background: rgba(255,255,255,0.1); padding: 2px 4px; border-radius: 3px; }'
@@ -534,12 +535,14 @@ def check_version():
 def update_settings(settings: SettingsIn):
     CONFIG.enable_tfl = settings.enable_tfl
     CONFIG.enable_datastream = settings.enable_datastream
-    CONFIG.port = settings.port
+    # Only update port if provided (port config moved to GUI launcher)
+    if settings.port is not None:
+        CONFIG.port = settings.port
     CONFIG.theme = (settings.theme or "dark")
     save_config(CONFIG)
     return {
         "ok": True,
-        "message": "Settings updated. Restart app to apply new port.",
+        "message": "Settings updated.",
         "port": effective_port(),
         "enable_tfl": CONFIG.enable_tfl,
         "enable_datastream": CONFIG.enable_datastream,
@@ -1091,9 +1094,6 @@ def settings_page():
     # General
     parts.append("<fieldset><legend>General</legend>")
     parts.append('<form id="settings-form">')
-    parts.append('<label>Port (takes effect on next restart)')
-    parts.append('<input id="port-input" name="port" type="number" value="' + str(effective_port()) + '" />')
-    parts.append("</label>")
     parts.append('<label><input type="checkbox" id="enable-tfl" ' + ('checked' if CONFIG.enable_tfl else '') + ' /> Enable TfL integration</label>')
     parts.append('<label><input type="checkbox" id="enable-ds" ' + ('checked' if CONFIG.enable_datastream else '') + ' /> Enable Data Stream integration</label>')
     parts.append('<label>Theme <select id="theme-select">')
@@ -1102,6 +1102,7 @@ def settings_page():
     parts.append("</select></label>")
     parts.append('<button type="submit">Save Settings</button>')
     parts.append("</form>")
+    parts.append("<p><strong>Note:</strong> Port configuration has been moved to the GUI launcher.</p>")
     parts.append("<p>Config file: <code>" + html_escape(str(CONFIG_PATH)) + "</code></p>")
     parts.append("</fieldset>")
     # Config Import/Export
@@ -1130,15 +1131,13 @@ def settings_page():
     parts.append("}")
     parts.append('document.getElementById("settings-form").onsubmit = async (e) => {')
     parts.append("  e.preventDefault();")
-    parts.append('  const portVal = document.getElementById("port-input").value;')
-    parts.append("  const port = portVal ? parseInt(portVal, 10) : null;")
     parts.append('  const enable_tfl = document.getElementById("enable-tfl").checked;')
     parts.append('  const enable_datastream = document.getElementById("enable-ds").checked;')
     parts.append('  const theme = document.getElementById("theme-select").value || "dark";')
-    parts.append('  const data = await postJSON("/settings", { port, enable_tfl, enable_datastream, theme });')
-    parts.append("  alert(data.message || 'Settings saved. Restart app to apply new port.');")
+    parts.append('  const data = await postJSON("/settings", { port: null, enable_tfl, enable_datastream, theme });')
+    parts.append("  alert(data.message || 'Settings saved.');")
     parts.append("  location.reload();")
-    parts.append("};")
+    parts.append("}")
     parts.append("async function checkUpdates() {")
     parts.append('  const out = document.getElementById("update-output");')
     parts.append('  out.textContent = "Checking for updates...";')
