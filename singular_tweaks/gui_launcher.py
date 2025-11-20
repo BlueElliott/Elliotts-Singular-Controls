@@ -299,7 +299,12 @@ class SingularTweaksGUI:
 
     def toggle_console(self):
         """Toggle console window visibility."""
-        if self.console_window is None or not tk.Toplevel.winfo_exists(self.console_window):
+        try:
+            window_exists = self.console_window is not None and self.console_window.winfo_exists()
+        except:
+            window_exists = False
+
+        if not window_exists:
             # Create console window
             self.console_window = tk.Toplevel(self.root)
             self.console_window.title("Console Output")

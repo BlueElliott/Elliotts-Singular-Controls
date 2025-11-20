@@ -1137,7 +1137,7 @@ def settings_page():
     parts.append('  const data = await postJSON("/settings", { port: null, enable_tfl, enable_datastream, theme });')
     parts.append("  alert(data.message || 'Settings saved.');")
     parts.append("  location.reload();")
-    parts.append("}")
+    parts.append("};")
     parts.append("async function checkUpdates() {")
     parts.append('  const out = document.getElementById("update-output");')
     parts.append('  out.textContent = "Checking for updates...";')
