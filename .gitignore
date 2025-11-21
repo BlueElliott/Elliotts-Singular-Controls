@@ -1,6 +1,7 @@
 # Python cache
 __pycache__/
 *.py[cod]
+*.pyc
 
 # Virtual environments
 .venv/
@@ -17,6 +18,9 @@ dist/
 
 # VS Code
 .vscode/
+
+# Claude Code local settings
+.claude/
 
 # Config files (user-specific, don't commit)
 singular_tweaks_config.json

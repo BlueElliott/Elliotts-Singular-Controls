@@ -6,6 +6,7 @@ import sys
 import time
 import threading
 import webbrowser
+import logging
 import tkinter as tk
 from tkinter import scrolledtext, messagebox
 from pathlib import Path
@@ -44,19 +45,21 @@ class SingularTweaksGUI:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Singular Tweaks")
-        self.root.geometry("700x500")
+        self.root.geometry("750x550")
         self.root.resizable(False, False)
 
         # Modern dark theme colors (inspired by CUEZ Automator)
-        self.bg_dark = "#1e1e1e"
-        self.bg_medium = "#2b2b2b"
+        self.bg_dark = "#0a0a0a"
+        self.bg_medium = "#1a1a1a"
+        self.bg_card = "#1e1e1e"
         self.accent_teal = "#00bcd4"
+        self.accent_teal_dark = "#0097a7"
         self.text_light = "#ffffff"
-        self.text_gray = "#b0b0b0"
-        self.button_blue = "#3f51b5"
+        self.text_gray = "#888888"
+        self.button_blue = "#2196f3"
         self.button_green = "#4caf50"
-        self.button_red = "#f44336"
-        self.button_gray = "#424242"
+        self.button_red = "#ff5252"
+        self.button_gray = "#2a2a2a"
 
         self.root.configure(bg=self.bg_dark)
 
@@ -65,6 +68,8 @@ class SingularTweaksGUI:
         self.server_thread = None
         self.server_running = False
         self.console_visible = False
+        self.console_text = None
+        self.log_handler = None
 
         self.setup_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -107,165 +112,185 @@ class SingularTweaksGUI:
         ]
         return canvas.create_polygon(points, **kwargs, smooth=True)
 
+    def create_rounded_button(self, parent, text, command, bg_color, width=180, height=50, state=tk.NORMAL):
+        """Create a modern rounded button using canvas."""
+        canvas = tk.Canvas(
+            parent,
+            width=width,
+            height=height,
+            bg=self.bg_dark,
+            highlightthickness=0,
+            bd=0
+        )
+
+        # Draw rounded rectangle
+        radius = 12
+        canvas.create_oval(0, 0, radius*2, radius*2, fill=bg_color, outline="")
+        canvas.create_oval(width-radius*2, 0, width, radius*2, fill=bg_color, outline="")
+        canvas.create_oval(0, height-radius*2, radius*2, height, fill=bg_color, outline="")
+        canvas.create_oval(width-radius*2, height-radius*2, width, height, fill=bg_color, outline="")
+        canvas.create_rectangle(radius, 0, width-radius, height, fill=bg_color, outline="")
+        canvas.create_rectangle(0, radius, width, height-radius, fill=bg_color, outline="")
+
+        # Add text
+        text_id = canvas.create_text(
+            width/2, height/2,
+            text=text,
+            fill=self.text_light if state == tk.NORMAL else self.text_gray,
+            font=("Arial", 11, "bold")
+        )
+
+        # Bind click event
+        if state == tk.NORMAL:
+            canvas.bind("<Button-1>", lambda e: command())
+            canvas.bind("<Enter>", lambda e: canvas.configure(cursor="hand2"))
+            canvas.bind("<Leave>", lambda e: canvas.configure(cursor=""))
+
+        canvas.button_state = state
+        return canvas
+
     def setup_ui(self):
         """Setup the main UI with modern dark theme."""
         # Top section with branding
-        top_frame = tk.Frame(self.root, bg=self.bg_dark, height=120)
+        top_frame = tk.Frame(self.root, bg=self.bg_dark, height=100)
         top_frame.pack(fill=tk.X, padx=0, pady=0)
         top_frame.pack_propagate(False)
 
         # Branding text (simple text logo like CUEZ)
         brand_label = tk.Label(
             top_frame,
-            text="SINGULAR\nTWEAKS",
-            font=("Arial", 20, "bold"),
+            text="SINGULAR TWEAKS",
+            font=("Arial", 24, "bold"),
             bg=self.bg_dark,
             fg=self.text_light,
             justify=tk.LEFT
         )
-        brand_label.place(x=30, y=25)
+        brand_label.place(x=40, y=30)
 
-        # Version badge
+        # Version badge (circular style)
+        version_frame = tk.Frame(top_frame, bg=self.bg_medium)
         version_label = tk.Label(
-            top_frame,
+            version_frame,
             text=f"v{_runtime_version()}",
             font=("Arial", 9),
             bg=self.bg_medium,
             fg=self.text_gray,
-            padx=8,
-            pady=4
+            padx=12,
+            pady=6
         )
-        version_label.place(x=30, y=90)
+        version_label.pack()
+        version_frame.place(x=40, y=70)
 
         # Main content area
         content_frame = tk.Frame(self.root, bg=self.bg_dark)
-        content_frame.pack(fill=tk.BOTH, expand=True, padx=30, pady=20)
+        content_frame.pack(fill=tk.BOTH, expand=True, padx=40, pady=(10, 30))
 
-        # Port configuration section (softened edges with relief)
-        port_frame = tk.Frame(content_frame, bg=self.accent_teal, height=80, relief=tk.FLAT, bd=0)
-        port_frame.pack(fill=tk.X, pady=(0, 20))
-        port_frame.pack_propagate(False)
+        # Port card with rounded corners
+        port_card = tk.Frame(content_frame, bg=self.bg_card, height=120)
+        port_card.pack(fill=tk.X, pady=(0, 25))
+        port_card.pack_propagate(False)
 
-        # Port display and change button
-        port_container = tk.Frame(port_frame, bg=self.accent_teal)
-        port_container.pack(expand=True)
+        # Port display section
+        port_display_frame = tk.Frame(port_card, bg=self.bg_card)
+        port_display_frame.pack(pady=20)
 
+        tk.Label(
+            port_display_frame,
+            text="SERVER PORT",
+            font=("Arial", 9, "bold"),
+            bg=self.bg_card,
+            fg=self.text_gray
+        ).pack()
+
+        # Port number with teal highlight
+        port_number_frame = tk.Frame(port_display_frame, bg=self.accent_teal)
         self.port_label = tk.Label(
-            port_container,
+            port_number_frame,
             text=str(effective_port()),
-            font=("Arial", 24, "bold"),
+            font=("Arial", 32, "bold"),
             bg=self.accent_teal,
-            fg=self.text_light
-        )
-        self.port_label.pack(side=tk.LEFT, padx=20)
-
-        self.port_change_btn = tk.Button(
-            port_container,
-            text="Change port",
-            command=self.change_port,
-            bg=self.button_blue,
             fg=self.text_light,
-            font=("Arial", 11),
-            relief=tk.FLAT,
-            cursor="hand2",
-            padx=20,
-            pady=8,
-            bd=0,
+            padx=30,
+            pady=10
+        )
+        self.port_label.pack()
+        port_number_frame.pack(pady=8)
+
+        # Change port button (small, rounded)
+        change_btn_canvas = tk.Canvas(
+            port_display_frame,
+            width=120,
+            height=32,
+            bg=self.bg_card,
             highlightthickness=0
         )
-        self.port_change_btn.pack(side=tk.LEFT, padx=10)
+        radius = 16
+        change_btn_canvas.create_oval(0, 0, radius*2, radius*2, fill=self.bg_medium, outline="")
+        change_btn_canvas.create_oval(120-radius*2, 0, 120, radius*2, fill=self.bg_medium, outline="")
+        change_btn_canvas.create_oval(0, 32-radius*2, radius*2, 32, fill=self.bg_medium, outline="")
+        change_btn_canvas.create_oval(120-radius*2, 32-radius*2, 120, 32, fill=self.bg_medium, outline="")
+        change_btn_canvas.create_rectangle(radius, 0, 120-radius, 32, fill=self.bg_medium, outline="")
+        change_btn_canvas.create_rectangle(0, radius, 120, 32-radius, fill=self.bg_medium, outline="")
+        change_btn_canvas.create_text(60, 16, text="Change Port", fill=self.text_gray, font=("Arial", 9))
+        change_btn_canvas.bind("<Button-1>", lambda e: self.change_port())
+        change_btn_canvas.bind("<Enter>", lambda e: change_btn_canvas.configure(cursor="hand2"))
+        change_btn_canvas.bind("<Leave>", lambda e: change_btn_canvas.configure(cursor=""))
+        change_btn_canvas.pack(pady=5)
 
         # Status message
         self.status_label = tk.Label(
             content_frame,
-            text="Running all interfaces on port " + str(effective_port()),
-            font=("Arial", 11),
+            text="● Server running on all interfaces",
+            font=("Arial", 10),
             bg=self.bg_dark,
-            fg=self.text_light
+            fg=self.accent_teal
         )
-        self.status_label.pack(pady=(0, 5))
+        self.status_label.pack(pady=(0, 3))
 
         self.url_label = tk.Label(
             content_frame,
-            text=f"e.g. http://127.0.0.1:{effective_port()}/",
+            text=f"http://127.0.0.1:{effective_port()}/",
             font=("Arial", 10),
             bg=self.bg_dark,
             fg=self.text_gray
         )
-        self.url_label.pack(pady=(0, 20))
+        self.url_label.pack(pady=(0, 30))
 
-        # Action buttons row
-        btn_frame = tk.Frame(content_frame, bg=self.bg_dark)
-        btn_frame.pack(pady=20)
+        # Action buttons (2x2 grid with better spacing)
+        btn_container = tk.Frame(content_frame, bg=self.bg_dark)
+        btn_container.pack()
 
-        # Open GUI Button
-        self.launch_btn = tk.Button(
-            btn_frame,
-            text="Open GUI",
-            command=self.launch_browser,
-            bg=self.button_blue,
-            fg=self.text_light,
-            font=("Arial", 11),
-            width=12,
-            height=2,
-            relief=tk.FLAT,
-            cursor="hand2",
-            state=tk.DISABLED,
-            bd=0,
-            highlightthickness=0
+        # Row 1
+        row1 = tk.Frame(btn_container, bg=self.bg_dark)
+        row1.pack(pady=8)
+
+        self.launch_btn = self.create_rounded_button(
+            row1, "Open Web GUI", self.launch_browser,
+            self.button_blue, width=290, height=55, state=tk.DISABLED
         )
-        self.launch_btn.grid(row=0, column=0, padx=10)
+        self.launch_btn.pack(side=tk.LEFT, padx=8)
 
-        # Open Console Button
-        self.console_toggle_btn = tk.Button(
-            btn_frame,
-            text="Open Console",
-            command=self.toggle_console,
-            bg=self.button_gray,
-            fg=self.text_light,
-            font=("Arial", 11),
-            width=12,
-            height=2,
-            relief=tk.FLAT,
-            cursor="hand2",
-            bd=0,
-            highlightthickness=0
+        self.console_toggle_btn = self.create_rounded_button(
+            row1, "Open Console", self.toggle_console,
+            self.button_gray, width=290, height=55
         )
-        self.console_toggle_btn.grid(row=0, column=1, padx=10)
+        self.console_toggle_btn.pack(side=tk.LEFT, padx=8)
 
-        # Hide Button
-        self.hide_btn = tk.Button(
-            btn_frame,
-            text="Hide",
-            command=self.minimize_to_tray,
-            bg=self.button_gray,
-            fg=self.text_light,
-            font=("Arial", 11),
-            width=12,
-            height=2,
-            relief=tk.FLAT,
-            cursor="hand2",
-            bd=0,
-            highlightthickness=0
-        )
-        self.hide_btn.grid(row=0, column=2, padx=10)
+        # Row 2
+        row2 = tk.Frame(btn_container, bg=self.bg_dark)
+        row2.pack(pady=8)
 
-        # Quit Button
-        self.quit_btn = tk.Button(
-            btn_frame,
-            text="Quit",
-            command=self.on_closing,
-            bg=self.button_red,
-            fg=self.text_light,
-            font=("Arial", 11),
-            width=12,
-            height=2,
-            relief=tk.FLAT,
-            cursor="hand2",
-            bd=0,
-            highlightthickness=0
+        self.hide_btn = self.create_rounded_button(
+            row2, "Hide to Tray", self.minimize_to_tray,
+            self.button_gray, width=290, height=55
         )
-        self.quit_btn.grid(row=0, column=3, padx=10)
+        self.hide_btn.pack(side=tk.LEFT, padx=8)
+
+        self.quit_btn = self.create_rounded_button(
+            row2, "Quit Server", self.on_closing,
+            self.button_red, width=290, height=55
+        )
+        self.quit_btn.pack(side=tk.LEFT, padx=8)
 
         # Console output (hidden by default, will be shown in new window)
         self.console_window = None
@@ -298,6 +323,13 @@ class SingularTweaksGUI:
                 f"Port changed to {new_port}. Please restart the application for changes to take effect."
             )
 
+    def update_button_text(self, canvas, new_text):
+        """Update text on a canvas button."""
+        for item in canvas.find_all():
+            if canvas.type(item) == "text":
+                canvas.itemconfig(item, text=new_text)
+                break
+
     def toggle_console(self):
         """Toggle console window visibility."""
         try:
@@ -313,7 +345,7 @@ class SingularTweaksGUI:
             self.console_window.configure(bg=self.bg_dark)
 
             # Console output
-            console_text = scrolledtext.ScrolledText(
+            self.console_text = scrolledtext.ScrolledText(
                 self.console_window,
                 bg="#1e1e1e",
                 fg="#d4d4d4",
@@ -321,34 +353,45 @@ class SingularTweaksGUI:
                 relief=tk.FLAT,
                 wrap=tk.WORD
             )
-            console_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            self.console_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
             # Add initial status message
             port = effective_port()
-            console_text.insert(tk.END, f"Singular Tweaks v{_runtime_version()}\n")
-            console_text.insert(tk.END, "=" * 60 + "\n")
+            self.console_text.insert(tk.END, f"Singular Tweaks v{_runtime_version()}\n")
+            self.console_text.insert(tk.END, "=" * 60 + "\n")
             if self.server_running:
-                console_text.insert(tk.END, f"✓ Server running on http://0.0.0.0:{port}\n")
-                console_text.insert(tk.END, f"  Access at: http://localhost:{port}\n")
+                self.console_text.insert(tk.END, f"✓ Server running on http://0.0.0.0:{port}\n")
+                self.console_text.insert(tk.END, f"  Access at: http://localhost:{port}\n")
             else:
-                console_text.insert(tk.END, "⚠ Server not running\n")
-            console_text.insert(tk.END, "=" * 60 + "\n\n")
-            console_text.insert(tk.END, "Console output will appear here...\n\n")
+                self.console_text.insert(tk.END, "⚠ Server not running\n")
+            self.console_text.insert(tk.END, "=" * 60 + "\n\n")
+            self.console_text.insert(tk.END, "Console output will appear here...\n\n")
 
             # Redirect stdout to console
-            sys.stdout = ConsoleRedirector(console_text)
-            sys.stderr = ConsoleRedirector(console_text)
+            sys.stdout = ConsoleRedirector(self.console_text)
+            sys.stderr = ConsoleRedirector(self.console_text)
+
+            # Set up logging handler for the root logger
+            self.log_handler = TkinterLogHandler(self.console_text)
+            formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
+            self.log_handler.setFormatter(formatter)
+            logging.getLogger().addHandler(self.log_handler)
+            logging.getLogger().setLevel(logging.INFO)
 
             # Write a test message
             print(f"[Console] Console window opened at {time.strftime('%H:%M:%S')}")
 
-            self.console_toggle_btn.config(text="Close Console")
+            self.update_button_text(self.console_toggle_btn, "Close Console")
             self.console_visible = True
         else:
             # Close console window
+            if self.log_handler:
+                logging.getLogger().removeHandler(self.log_handler)
+                self.log_handler = None
             self.console_window.destroy()
             self.console_window = None
-            self.console_toggle_btn.config(text="Open Console")
+            self.console_text = None
+            self.update_button_text(self.console_toggle_btn, "Open Console")
             self.console_visible = False
 
     def start_server(self):
@@ -386,33 +429,54 @@ class SingularTweaksGUI:
             # Configure basic logging to avoid uvicorn formatter errors
             logging.basicConfig(
                 level=logging.INFO,
-                format='%(levelname)s: %(message)s',
+                format='%(asctime)s - %(levelname)s - %(message)s',
+                datefmt='%H:%M:%S',
                 force=True
             )
 
-            # Configure uvicorn with custom logging to avoid formatter errors
+            # Configure uvicorn with custom logging and access log enabled
             config = uvicorn.Config(
                 app,
                 host="0.0.0.0",
                 port=effective_port(),
                 log_level="info",
-                access_log=False,  # Disable access log to reduce console noise
+                access_log=True,  # Enable access log to see HTTP requests
                 log_config=None  # Disable default log config
             )
             server = uvicorn.Server(config)
+            print(f"[Server] Starting uvicorn server on port {effective_port()}")
             server.run()
         except Exception as e:
-            print(f"Error starting server: {e}")
+            print(f"[Server] Error starting server: {e}")
             import traceback
             traceback.print_exc()
+
+    def enable_canvas_button(self, canvas, bg_color):
+        """Enable a canvas button."""
+        canvas.button_state = tk.NORMAL
+        # Recreate the button with proper colors
+        canvas.delete("all")
+        width = int(canvas['width'])
+        height = int(canvas['height'])
+        radius = 12
+        canvas.create_oval(0, 0, radius*2, radius*2, fill=bg_color, outline="")
+        canvas.create_oval(width-radius*2, 0, width, radius*2, fill=bg_color, outline="")
+        canvas.create_oval(0, height-radius*2, radius*2, height, fill=bg_color, outline="")
+        canvas.create_oval(width-radius*2, height-radius*2, width, height, fill=bg_color, outline="")
+        canvas.create_rectangle(radius, 0, width-radius, height, fill=bg_color, outline="")
+        canvas.create_rectangle(0, radius, width, height-radius, fill=bg_color, outline="")
+        canvas.create_text(width/2, height/2, text="Open Web GUI", fill=self.text_light, font=("Arial", 11, "bold"))
+        canvas.bind("<Button-1>", lambda e: self.launch_browser())
+        canvas.bind("<Enter>", lambda e: canvas.configure(cursor="hand2"))
+        canvas.bind("<Leave>", lambda e: canvas.configure(cursor=""))
 
     def _server_started(self):
         """Update UI after server starts."""
         port = effective_port()
         self.server_running = True
-        self.status_label.config(text=f"Running all interfaces on port {port}")
-        self.url_label.config(text=f"e.g. http://127.0.0.1:{port}/")
-        self.launch_btn.config(state=tk.NORMAL)
+        self.status_label.config(text=f"● Server running on all interfaces")
+        self.url_label.config(text=f"http://127.0.0.1:{port}/")
+        self.enable_canvas_button(self.launch_btn, self.button_blue)
 
     def launch_browser(self):
         """Open the web GUI in default browser."""
@@ -466,12 +530,31 @@ class ConsoleRedirector:
         self.buffer = StringIO()
 
     def write(self, message):
-        self.text_widget.insert(tk.END, message)
-        self.text_widget.see(tk.END)
+        try:
+            self.text_widget.insert(tk.END, message)
+            self.text_widget.see(tk.END)
+        except:
+            pass  # Widget may be destroyed
         self.buffer.write(message)
 
     def flush(self):
         pass
+
+
+class TkinterLogHandler(logging.Handler):
+    """Custom logging handler that writes to a Tkinter Text widget."""
+
+    def __init__(self, text_widget):
+        super().__init__()
+        self.text_widget = text_widget
+
+    def emit(self, record):
+        try:
+            msg = self.format(record) + '\n'
+            self.text_widget.insert(tk.END, msg)
+            self.text_widget.see(tk.END)
+        except:
+            pass  # Widget may be destroyed
 
 
 def main():
