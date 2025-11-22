@@ -58,7 +58,7 @@ jobs:
           cat version.txt
 
       - name: Build executable with PyInstaller
-        run: pyinstaller SingularTweaks.spec
+        run: pyinstaller scripts/SingularTweaks.spec
 
       - name: Verify executable exists
         run: |

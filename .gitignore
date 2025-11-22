@@ -21,6 +21,7 @@ dist/
 
 # Claude Code local settings
 .claude/
+SESSION_SUMMARY.md
 
 # Config files (user-specific, don't commit)
 singular_tweaks_config.json
