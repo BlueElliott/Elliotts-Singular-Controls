@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <style>
+      .bg { fill: #1a1a1a; }
+      .line { fill: none; stroke: #00bcd4; stroke-width: 12; stroke-linecap: round; stroke-linejoin: round; }
+      .text { fill: #00bcd4; font-family: Arial, sans-serif; font-weight: bold; font-size: 64px; }
+      .check { fill: none; stroke: #00bcd4; stroke-width: 14; stroke-linecap: round; stroke-linejoin: round; }
+    </style>
+  </defs>
+
+  <!-- Background -->
+  <rect class="bg" width="512" height="512" rx="64"/>
+
+  <!-- Outer circle -->
+  <circle class="line" cx="256" cy="256" r="140"/>
+
+  <!-- Middle circle -->
+  <circle class="line" cx="256" cy="256" r="95"/>
+
+  <!-- Inner circle -->
+  <circle class="line" cx="256" cy="256" r="50"/>
+
+  <!-- Line to E (top - 12 o'clock) -->
+  <line class="line" x1="256" y1="116" x2="256" y2="50"/>
+
+  <!-- Line to S (bottom - 6 o'clock, but slightly left like in image) -->
+  <line class="line" x1="220" y1="388" x2="190" y2="440"/>
+
+  <!-- Line to C (right - 3 o'clock) -->
+  <line class="line" x1="396" y1="256" x2="450" y2="256"/>
+
+  <!-- Maze gap/opening (bottom right of outer ring) -->
+  <line class="line" x1="340" y1="370" x2="380" y2="410"/>
+
+  <!-- Checkmark in center -->
+  <polyline class="check" points="230,256 250,276 285,230"/>
+
+  <!-- Letters -->
+  <text class="text" x="256" y="45" text-anchor="middle" dominant-baseline="middle">E</text>
+  <text class="text" x="175" y="480" text-anchor="middle" dominant-baseline="middle">S</text>
+  <text class="text" x="480" y="265" text-anchor="middle" dominant-baseline="middle">C</text>
+</svg>

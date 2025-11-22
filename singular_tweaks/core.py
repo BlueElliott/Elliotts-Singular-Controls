@@ -4,10 +4,12 @@ import time
 import re
 import json
 import logging
+import traceback
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from urllib.parse import quote
 from html import escape as html_escape
+from datetime import datetime
 
 import requests
 from fastapi import FastAPI, Query, HTTPException, Request
@@ -16,6 +18,54 @@ from fastapi.routing import APIRoute
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
+
+
+# ================== CRASH LOGGING ==================
+
+def _crash_log_path() -> Path:
+    """Get path to crash log file in app data directory."""
+    if sys.platform == "win32":
+        app_data = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    else:
+        app_data = Path.home() / ".local" / "share"
+    log_dir = app_data / "ElliottsSingularControls" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / "crash_report.txt"
+
+
+def log_crash(error: Exception, context: str = ""):
+    """Log a crash/error to the crash report file."""
+    try:
+        log_path = _crash_log_path()
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write("=" * 60 + "\n")
+            f.write(f"CRASH REPORT - {timestamp}\n")
+            f.write(f"Version: {_runtime_version()}\n")
+            if context:
+                f.write(f"Context: {context}\n")
+            f.write(f"Error Type: {type(error).__name__}\n")
+            f.write(f"Error Message: {str(error)}\n")
+            f.write("\nTraceback:\n")
+            f.write(traceback.format_exc())
+            f.write("\n")
+    except Exception:
+        pass  # Don't crash while logging crashes
+
+
+def setup_crash_handler():
+    """Setup global exception handler to log unhandled exceptions."""
+    def exception_handler(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        log_crash(exc_value, "Unhandled exception")
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+    sys.excepthook = exception_handler
+
+
+# Initialize crash handler
+setup_crash_handler()
 
 # ================== 0. PATHS & VERSION ==================
 
@@ -59,6 +109,66 @@ TFL_URL = (
     "tube,overground,dlr,elizabeth-line,tram,cable-car/Status"
 )
 
+# Underground lines
+TFL_UNDERGROUND = [
+    "Bakerloo",
+    "Central",
+    "Circle",
+    "District",
+    "Hammersmith & City",
+    "Jubilee",
+    "Metropolitan",
+    "Northern",
+    "Piccadilly",
+    "Victoria",
+    "Waterloo & City",
+]
+
+# Overground/Other lines
+TFL_OVERGROUND = [
+    "Liberty",
+    "Lioness",
+    "Mildmay",
+    "Suffragette",
+    "Weaver",
+    "Windrush",
+    "DLR",
+    "Elizabeth line",
+    "Tram",
+    "IFS Cloud Cable Car",
+]
+
+# All TFL lines combined
+TFL_LINES = TFL_UNDERGROUND + TFL_OVERGROUND
+
+# Official TFL line colours (matched to TfL brand guidelines)
+TFL_LINE_COLOURS = {
+    # Underground
+    "Bakerloo": "#B36305",
+    "Central": "#E32017",
+    "Circle": "#FFD300",
+    "District": "#00782A",
+    "Hammersmith & City": "#F3A9BB",
+    "Jubilee": "#A0A5A9",
+    "Metropolitan": "#9B0056",
+    "Northern": "#000000",
+    "Piccadilly": "#003688",
+    "Victoria": "#0098D4",
+    "Waterloo & City": "#95CDBA",
+    # London Overground lines (new branding)
+    "Liberty": "#6bcdb2",
+    "Lioness": "#fbb01c",
+    "Mildmay": "#137cbd",
+    "Suffragette": "#6a9a3a",
+    "Weaver": "#9b4f7a",
+    "Windrush": "#e05206",
+    # Other rail
+    "DLR": "#00afad",
+    "Elizabeth line": "#6950a1",
+    "Tram": "#6fc42a",
+    "IFS Cloud Cable Car": "#e21836",
+}
+
 def _config_dir() -> Path:
     if getattr(sys, "frozen", False):
         base = Path(sys.executable).parent
@@ -79,8 +189,8 @@ class AppConfig(BaseModel):
     singular_stream_url: Optional[str] = None
     tfl_app_id: Optional[str] = None
     tfl_app_key: Optional[str] = None
-    enable_tfl: bool = True
-    enable_datastream: bool = True
+    enable_tfl: bool = False  # Disabled by default for new installs
+    tfl_auto_refresh: bool = False  # Auto-refresh TFL data every 60s
     theme: str = "dark"
     port: Optional[int] = None
 
@@ -91,8 +201,8 @@ def load_config() -> AppConfig:
         "singular_stream_url": os.getenv("SINGULAR_STREAM_URL") or None,
         "tfl_app_id": os.getenv("TFL_APP_ID") or None,
         "tfl_app_key": os.getenv("TFL_APP_KEY") or None,
-        "enable_tfl": True,
-        "enable_datastream": True,
+        "enable_tfl": False,  # Disabled by default
+        "tfl_auto_refresh": False,
         "theme": "dark",
         "port": int(os.getenv("SINGULAR_TWEAKS_PORT")) if os.getenv("SINGULAR_TWEAKS_PORT") else None,
     }
@@ -141,7 +251,7 @@ def generate_unique_id(route: APIRoute) -> str:
     return f"{route.name}-{method}-{safe_path}"
 
 app = FastAPI(
-    title="TfL + Singular Tweaks",
+    title="Elliott's Singular Controls",
     description="Helper UI and HTTP API for Singular.live + optional TfL data.",
     version=_runtime_version(),
     generate_unique_id_function=generate_unique_id,
@@ -177,10 +287,9 @@ def fetch_all_line_statuses() -> Dict[str, str]:
 
 
 def send_to_datastream(payload: Dict[str, Any]):
-    if not CONFIG.enable_datastream:
-        raise HTTPException(400, "Data Stream integration is disabled in settings")
     if not CONFIG.singular_stream_url:
         raise HTTPException(400, "No Singular data stream URL configured")
+    resp = None
     try:
         resp = requests.put(
             CONFIG.singular_stream_url,
@@ -198,8 +307,8 @@ def send_to_datastream(payload: Dict[str, Any]):
         logger.exception("Datastream PUT failed")
         return {
             "stream_url": CONFIG.singular_stream_url,
-            "status": getattr(resp, 'status_code', 0),
-            "response": getattr(resp, 'text', ''),
+            "status": resp.status_code if resp is not None else 0,
+            "response": resp.text if resp is not None else "",
             "error": str(e),
         }
 
@@ -346,8 +455,7 @@ class StreamConfigIn(BaseModel):
 
 class SettingsIn(BaseModel):
     port: Optional[int] = None
-    enable_tfl: bool = True
-    enable_datastream: bool = True
+    enable_tfl: bool = False
     theme: Optional[str] = "dark"
 
 class SingularItem(BaseModel):
@@ -359,12 +467,10 @@ class SingularItem(BaseModel):
 # ================== 5. HTML helpers ==================
 
 def _nav_html() -> str:
-    show_integrations = CONFIG.enable_tfl or CONFIG.enable_datastream
     parts = ['<div class="nav">']
     parts.append('<a href="/">Home</a>')
     parts.append('<a href="/commands">Commands</a>')
-    if show_integrations:
-        parts.append('<a href="/integrations">Integrations</a>')
+    parts.append('<a href="/modules">Modules</a>')
     parts.append('<a href="/settings">Settings</a>')
     parts.append('</div>')
     return "".join(parts)
@@ -373,12 +479,16 @@ def _nav_html() -> str:
 def _base_style() -> str:
     theme = CONFIG.theme or "dark"
     if theme == "light":
-        bg = "#f5f5f5"; fg = "#111"; card_bg = "#fff"; border = "#ccc"; accent = "#00bcd4"
+        bg = "#f0f2f5"; fg = "#1a1a2e"; card_bg = "#ffffff"; border = "#e0e0e0"; accent = "#00bcd4"
+        accent_hover = "#0097a7"; text_muted = "#666666"; input_bg = "#fafafa"
     else:
-        # Teal theme matching ITN interface
-        bg = "#1e1e1e"; fg = "#f5f5f5"; card_bg = "#2b2b2b"; border = "#424242"; accent = "#00bcd4"
+        # Modern dark theme - matched to desktop GUI colours
+        bg = "#1a1a1a"; fg = "#ffffff"; card_bg = "#2d2d2d"; border = "#3d3d3d"; accent = "#00bcd4"
+        accent_hover = "#0097a7"; text_muted = "#888888"; input_bg = "#252525"
 
     lines = []
+    lines.append('<link rel="icon" type="image/x-icon" href="/static/favicon.ico">')
+    lines.append('<link rel="icon" type="image/png" href="/static/esc_icon.png">')
     lines.append("<style>")
     lines.append("  @font-face {")
     lines.append("    font-family: 'ITVReem';")
@@ -386,42 +496,69 @@ def _base_style() -> str:
     lines.append("    font-weight: normal;")
     lines.append("    font-style: normal;")
     lines.append("  }")
+    lines.append("  * { box-sizing: border-box; }")
     lines.append(
-        "  body { font-family: 'ITVReem', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;"
-        f" max-width: 1000px; margin: 2rem auto; background: {bg}; color: {fg}; padding: 0 1rem; }}"
+        f"  body {{ font-family: 'ITVReem', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;"
+        f" max-width: 900px; margin: 0 auto; background: {bg}; color: {fg}; padding: 20px; line-height: 1.6; }}"
+    )
+    lines.append(f"  h1 {{ font-size: 28px; font-weight: 700; margin: 20px 0 8px 0; padding-top: 50px; color: {fg}; }}")
+    lines.append(f"  h1 + p {{ color: {text_muted}; margin-bottom: 24px; }}")
+    lines.append(
+        f"  fieldset {{ margin-bottom: 20px; padding: 20px 24px; background: {card_bg}; "
+        f"border: 1px solid {border}; border-radius: 12px; }}"
+    )
+    lines.append(f"  legend {{ font-weight: 600; padding: 0 12px; font-size: 14px; color: {text_muted}; }}")
+    lines.append(f"  label {{ display: block; margin-top: 12px; font-size: 14px; color: {text_muted}; }}")
+    lines.append(
+        f"  input, select {{ width: 100%; padding: 10px 14px; margin-top: 6px; "
+        f"background: {input_bg}; color: {fg}; border: 1px solid {border}; border-radius: 8px; "
+        f"font-size: 14px; transition: border-color 0.2s, box-shadow 0.2s; }}"
+    )
+    lines.append(f"  input:focus, select:focus {{ outline: none; border-color: {accent}; box-shadow: 0 0 0 3px {accent}33; }}")
+    lines.append(
+        f"  button {{ display: inline-flex; align-items: center; justify-content: center; gap: 8px; "
+        f"margin-top: 12px; margin-right: 8px; padding: 10px 20px; cursor: pointer; "
+        f"background: {accent}; color: #fff; border: none; border-radius: 8px; "
+        f"font-size: 14px; font-weight: 500; transition: all 0.2s; }}"
+    )
+    lines.append(f"  button:hover {{ background: {accent_hover}; transform: translateY(-1px); box-shadow: 0 4px 12px {accent}40; }}")
+    lines.append(f"  button:active {{ transform: translateY(0); }}")
+    lines.append(
+        f"  pre {{ background: #000; color: #4ade80; padding: 16px; white-space: pre-wrap; "
+        f"max-height: 250px; overflow: auto; border-radius: 8px; font-size: 13px; "
+        f"font-family: 'SF Mono', Monaco, 'Cascadia Code', Consolas, monospace; border: 1px solid {border}; }}"
     )
     lines.append(
-        f"  fieldset {{ margin-bottom: 1.5rem; padding: 1rem; background: {card_bg}; border: 1px solid {border}; border-radius: 4px; }}"
-    )
-    lines.append("  legend { font-weight: 600; padding: 0 0.5rem; }")
-    lines.append("  label { display:block; margin-top:0.5rem; }")
-    lines.append(
-        f"  input, select {{ width:100%; padding:0.35rem 0.5rem; box-sizing:border-box;"
-        f" background:{card_bg}; color:{fg}; border:1px solid {border}; border-radius: 3px; }}"
+        f"  .nav {{ position: fixed; top: 16px; left: 16px; display: flex; gap: 4px; z-index: 1000; "
+        f"background: {card_bg}; padding: 6px; border-radius: 10px; border: 1px solid {border}; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }}"
     )
     lines.append(
-        f"  button {{ margin-top:0.75rem; padding:0.4rem 0.8rem; cursor:pointer;"
-        f" background:{accent}; color:#fff; border:none; border-radius: 3px; }}"
+        f"  .nav a {{ color: {text_muted}; text-decoration: none; padding: 8px 14px; border-radius: 6px; "
+        f"font-size: 13px; font-weight: 500; transition: all 0.2s; }}"
     )
-    lines.append("  button:hover { opacity: 0.9; }")
+    lines.append(f"  .nav a:hover {{ background: {input_bg}; color: {accent}; }}")
+    lines.append(f"  table {{ border-collapse: collapse; width: 100%; margin-top: 12px; border-radius: 8px; overflow: hidden; }}")
+    lines.append(f"  th, td {{ border: 1px solid {border}; padding: 10px 14px; font-size: 13px; text-align: left; }}")
+    lines.append(f"  th {{ background: {accent}; color: #fff; font-weight: 600; }}")
+    lines.append(f"  tr:nth-child(even) td {{ background: {input_bg}; }}")
+    lines.append(f"  tr:hover td {{ background: {border}; }}")
     lines.append(
-        "  pre { background:#000; color:#0f0; padding:0.5rem; white-space:pre-wrap; max-height:300px; overflow:auto; border-radius: 3px; }"
+        f"  code {{ font-family: 'SF Mono', Monaco, 'Cascadia Code', Consolas, monospace; "
+        f"background: {input_bg}; padding: 3px 8px; border-radius: 6px; font-size: 12px; "
+        f"border: 1px solid {border}; display: inline-block; max-width: 450px; overflow-x: auto; "
+        f"white-space: nowrap; vertical-align: middle; }}"
     )
-    lines.append(
-        "  .version-badge { position:fixed; top:10px; right:10px; background:#222; color:#fff;"
-        " padding:4px 10px; border-radius:999px; font-size:12px; opacity:0.9; }"
-    )
-    lines.append("  .nav { position:fixed; top:10px; left:10px; font-size:13px; }")
-    lines.append(f"  .nav a {{ color:{accent}; text-decoration:none; margin-right:8px; }}")
-    lines.append("  .nav a:hover { text-decoration: underline; }")
-    lines.append("  table { border-collapse:collapse; width:100%; margin-top:0.5rem; }")
-    lines.append(f"  th, td {{ border:1px solid {border}; padding:6px 8px; font-size:13px; }}")
-    lines.append(f"  th {{ background:{accent}; color:#fff; text-align: left; }}")
-    lines.append(
-        "  code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,"
-        ' "Liberation Mono", "Courier New", monospace; background: rgba(255,255,255,0.1); padding: 2px 4px; border-radius: 3px; }'
-    )
-    lines.append("  h1, h2, h3 { margin-top: 1rem; }")
+    lines.append(f"  h3 {{ margin-top: 24px; margin-bottom: 8px; font-size: 16px; color: {fg}; }}")
+    lines.append(f"  h3 small {{ color: {text_muted}; font-weight: 400; }}")
+    lines.append(f"  p {{ margin: 8px 0; }}")
+    lines.append(f"  .status-badge {{ display: inline-flex; align-items: center; gap: 6px; padding: 4px 12px; border-radius: 20px; font-size: 13px; }}")
+    lines.append(f"  .status-badge.success {{ background: #10b98120; color: #10b981; }}")
+    lines.append(f"  .status-badge.error {{ background: #ef444420; color: #ef4444; }}")
+    lines.append(f"  .status-badge.warning {{ background: #f59e0b20; color: #f59e0b; }}")
+    lines.append(f"  .play-btn {{ display: inline-flex; align-items: center; justify-content: center; width: 32px; height: 32px; "
+                 f"background: {accent}; color: #fff; border-radius: 50%; text-decoration: none; font-size: 14px; "
+                 f"transition: all 0.2s; }}")
+    lines.append(f"  .play-btn:hover {{ background: {accent_hover}; transform: scale(1.1); box-shadow: 0 2px 8px {accent}60; }}")
     lines.append("</style>")
     return "\n".join(lines)
 
@@ -444,7 +581,7 @@ def get_config():
             "port": effective_port(),
             "raw_port": CONFIG.port,
             "enable_tfl": CONFIG.enable_tfl,
-            "enable_datastream": CONFIG.enable_datastream,
+            "tfl_auto_refresh": CONFIG.tfl_auto_refresh,
             "theme": CONFIG.theme,
         },
     }
@@ -471,9 +608,33 @@ def set_tfl_config(cfg: TflConfigIn):
 
 @app.post("/config/stream")
 def set_stream_config(cfg: StreamConfigIn):
-    CONFIG.singular_stream_url = cfg.stream_url
+    url = cfg.stream_url.strip()
+    # Auto-prefix if user just enters the datastream ID
+    if url and not url.startswith("http"):
+        url = f"https://datastream.singular.live/datastreams/{url}"
+    CONFIG.singular_stream_url = url
     save_config(CONFIG)
-    return {"ok": True, "message": "Data Stream URL updated"}
+    return {"ok": True, "message": "Data Stream URL updated", "url": url}
+
+
+class ModuleToggleIn(BaseModel):
+    enabled: bool
+
+
+@app.post("/config/module/tfl")
+def toggle_tfl_module(cfg: ModuleToggleIn):
+    CONFIG.enable_tfl = cfg.enabled
+    if not cfg.enabled:
+        CONFIG.tfl_auto_refresh = False  # Disable auto-refresh when module is disabled
+    save_config(CONFIG)
+    return {"ok": True, "enabled": CONFIG.enable_tfl}
+
+
+@app.post("/config/module/tfl/auto-refresh")
+def toggle_tfl_auto_refresh(cfg: ModuleToggleIn):
+    CONFIG.tfl_auto_refresh = cfg.enabled
+    save_config(CONFIG)
+    return {"ok": True, "enabled": CONFIG.tfl_auto_refresh}
 
 
 @app.get("/settings/json")
@@ -482,7 +643,7 @@ def get_settings_json():
         "port": effective_port(),
         "raw_port": CONFIG.port,
         "enable_tfl": CONFIG.enable_tfl,
-        "enable_datastream": CONFIG.enable_datastream,
+        "tfl_auto_refresh": CONFIG.tfl_auto_refresh,
         "config_path": str(CONFIG_PATH),
         "theme": CONFIG.theme,
     }
@@ -534,7 +695,6 @@ def check_version():
 @app.post("/settings")
 def update_settings(settings: SettingsIn):
     CONFIG.enable_tfl = settings.enable_tfl
-    CONFIG.enable_datastream = settings.enable_datastream
     # Only update port if provided (port config moved to GUI launcher)
     if settings.port is not None:
         CONFIG.port = settings.port
@@ -545,7 +705,6 @@ def update_settings(settings: SettingsIn):
         "message": "Settings updated.",
         "port": effective_port(),
         "enable_tfl": CONFIG.enable_tfl,
-        "enable_datastream": CONFIG.enable_datastream,
         "theme": CONFIG.theme,
     }
 
@@ -571,8 +730,8 @@ def import_config(config_data: Dict[str, Any]):
             CONFIG.tfl_app_key = config_data["tfl_app_key"]
         if "enable_tfl" in config_data:
             CONFIG.enable_tfl = config_data["enable_tfl"]
-        if "enable_datastream" in config_data:
-            CONFIG.enable_datastream = config_data["enable_datastream"]
+        if "tfl_auto_refresh" in config_data:
+            CONFIG.tfl_auto_refresh = config_data["tfl_auto_refresh"]
         if "theme" in config_data:
             CONFIG.theme = config_data["theme"]
         if "port" in config_data:
@@ -669,6 +828,23 @@ def update_blank():
         return {"sent_to": "datastream", "payload": payload, **result}
     except Exception as e:
         raise HTTPException(500, f"Blank failed: {e}")
+
+
+@app.get("/tfl/lines")
+def get_tfl_lines():
+    """Return list of all TFL lines for the manual input UI."""
+    return {"lines": TFL_LINES}
+
+
+@app.post("/manual")
+def send_manual(payload: Dict[str, str]):
+    """Send a manual payload to the datastream."""
+    try:
+        result = send_to_datastream(payload)
+        log_event("DataStream manual", f"Sent manual payload with {len(payload)} lines")
+        return {"sent_to": "datastream", "payload": payload, **result}
+    except Exception as e:
+        raise HTTPException(500, f"Manual send failed: {e}")
 
 
 # ================== 8. Control app endpoints ==================
@@ -827,25 +1003,26 @@ def sub_timecontrol(
 def index():
     parts: List[str] = []
     parts.append("<html><head>")
-    parts.append("<title>Singular Tweaks v" + _runtime_version() + "</title>")
+    parts.append("<title>Elliott's Singular Controls v" + _runtime_version() + "</title>")
     parts.append(_base_style())
     parts.append("</head><body>")
     parts.append(_nav_html())
-    parts.append('<div class="version-badge">v' + _runtime_version() + " • port " + str(effective_port()) + "</div>")
-    parts.append("<h1>Singular Tweaks</h1>")
+    parts.append("<h1>Elliott's Singular Controls</h1>")
     parts.append("<p>Mainly used to send <strong>GET</strong> and simple HTTP commands to your Singular Control App.</p>")
+    # Show full token (not sensitive)
     saved = "Not set"
     if CONFIG.singular_token:
-        saved = "..." + CONFIG.singular_token[-6:]
-    parts.append('<fieldset><legend>Singular Control App</legend>')
-    parts.append("<p>Enter your <strong>Control App Token</strong> (from Singular.live).</p>")
-    parts.append('<p>Saved token: <code id="saved-token">' + html_escape(saved) + "</code></p>")
-    parts.append('<p>Status: <span id="singular-status">Unknown</span></p>')
-    parts.append('<form id="singular-form">')
-    parts.append('<label>Control App Token <input name="token" autocomplete="off" /></label>')
-    parts.append('<button type="submit">Save Token &amp; Refresh Commands</button>')
-    parts.append('<button type="button" onclick="pingSingular()">Ping Singular</button>')
-    parts.append('<button type="button" onclick="refreshRegistry()">Rebuild Command List</button>')
+        saved = CONFIG.singular_token
+    parts.append('<fieldset><legend>Singular Control App Token</legend>')
+    parts.append('<div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">')
+    parts.append('<span style="font-size:13px;color:#8b949e;">Current:</span>')
+    parts.append('<code id="saved-token" style="flex:1;max-width:none;">' + html_escape(saved) + "</code>")
+    parts.append('<span id="singular-status" class="status-badge warning">Unknown</span>')
+    parts.append('<button type="button" onclick="pingSingular()" style="margin:0;">Ping</button>')
+    parts.append("</div>")
+    parts.append('<form id="singular-form" style="display:flex;gap:8px;align-items:flex-end;">')
+    parts.append('<label style="flex:1;margin:0;">New Token <input name="token" autocomplete="off" placeholder="Paste your Control App Token here" /></label>')
+    parts.append('<button type="submit" style="margin:0;">Update Token</button>')
     parts.append("</form></fieldset>")
     parts.append('<fieldset><legend>Event Log</legend>')
     parts.append("<p>Shows recent HTTP commands and updates triggered by this tool.</p>")
@@ -872,7 +1049,7 @@ def index():
     parts.append("    const token = cfg.singular.token;")
     parts.append('    const saved = document.getElementById("saved-token");')
     parts.append("    if (tokenSet && token) {")
-    parts.append('      saved.textContent = "..." + token.slice(-6);')
+    parts.append('      saved.textContent = token;')
     parts.append("    } else {")
     parts.append('      saved.textContent = "Not set";')
     parts.append("    }")
@@ -881,6 +1058,7 @@ def index():
     parts.append("async function pingSingular() {")
     parts.append('  const statusEl = document.getElementById("singular-status");')
     parts.append('  statusEl.textContent = "Checking...";')
+    parts.append('  statusEl.className = "status-badge warning";')
     parts.append("  try {")
     parts.append('    const res = await fetch("/singular/ping");')
     parts.append("    const txt = await res.text();")
@@ -888,18 +1066,21 @@ def index():
     parts.append("      const data = JSON.parse(txt);")
     parts.append("      if (data.ok) {")
     parts.append('        statusEl.textContent = "Connected (" + (data.subs || 0) + " subs)";')
-    parts.append("      } else { statusEl.textContent = 'Error'; }")
-    parts.append("    } catch (e) { statusEl.textContent = txt; }")
-    parts.append("  } catch (e) { statusEl.textContent = 'Ping failed'; }")
+    parts.append('        statusEl.className = "status-badge success";')
+    parts.append('      } else { statusEl.textContent = "Error"; statusEl.className = "status-badge error"; }')
+    parts.append('    } catch (e) { statusEl.textContent = txt; statusEl.className = "status-badge error"; }')
+    parts.append('  } catch (e) { statusEl.textContent = "Ping failed"; statusEl.className = "status-badge error"; }')
     parts.append("}")
     parts.append("async function refreshRegistry() {")
     parts.append('  const statusEl = document.getElementById("singular-status");')
-    parts.append('  statusEl.textContent = "Refreshing registry...";')
+    parts.append('  statusEl.textContent = "Refreshing...";')
+    parts.append('  statusEl.className = "status-badge warning";')
     parts.append("  try {")
     parts.append('    const res = await fetch("/singular/refresh", { method: "POST" });')
     parts.append("    const data = await res.json();")
     parts.append('    statusEl.textContent = "Registry: " + (data.count || 0) + " subs";')
-    parts.append("  } catch (e) { statusEl.textContent = 'Refresh failed'; }")
+    parts.append('    statusEl.className = "status-badge success";')
+    parts.append('  } catch (e) { statusEl.textContent = "Refresh failed"; statusEl.className = "status-badge error"; }')
     parts.append("}")
     parts.append("async function loadEvents() {")
     parts.append("  try {")
@@ -928,65 +1109,387 @@ def index():
     return HTMLResponse("".join(parts))
 
 
-@app.get("/integrations", response_class=HTMLResponse)
-def integrations_page():
+@app.get("/modules", response_class=HTMLResponse)
+def modules_page():
     parts: List[str] = []
     parts.append("<html><head>")
-    parts.append("<title>Integrations - Singular Tweaks</title>")
+    parts.append("<title>Modules - Elliott's Singular Controls</title>")
     parts.append(_base_style())
+    parts.append("<style>")
+    parts.append("  .module-card { margin-bottom: 20px; }")
+    parts.append("  .module-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }")
+    parts.append("  .module-title { font-size: 18px; font-weight: 600; margin: 0; }")
+    parts.append("  .toggle-switch { position: relative; width: 50px; height: 26px; }")
+    parts.append("  .toggle-switch input { opacity: 0; width: 0; height: 0; }")
+    parts.append("  .toggle-slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background: #3d3d3d; border-radius: 26px; transition: 0.3s; }")
+    parts.append("  .toggle-slider:before { position: absolute; content: ''; height: 20px; width: 20px; left: 3px; bottom: 3px; background: white; border-radius: 50%; transition: 0.3s; }")
+    parts.append("  .toggle-switch input:checked + .toggle-slider { background: #00bcd4; }")
+    parts.append("  .toggle-switch input:checked + .toggle-slider:before { transform: translateX(24px); }")
+    parts.append("  .module-actions { display: flex; gap: 8px; margin-top: 16px; }")
+    parts.append("  .status-text { font-size: 13px; padding: 6px 12px; border-radius: 6px; }")
+    parts.append("  .status-text.success { background: #4caf5030; color: #4caf50; }")
+    parts.append("  .status-text.error { background: #ff525230; color: #ff5252; }")
+    parts.append("  .status-text.idle { background: #88888830; color: #888888; }")
+    parts.append("  @keyframes pulse-warning { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }")
+    parts.append("  .disconnect-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.9); display: none; justify-content: center; align-items: center; z-index: 9999; }")
+    parts.append("  .disconnect-overlay.active { animation: pulse-warning 1.5s ease-in-out infinite; }")
+    parts.append("  .disconnect-modal { background: #2d2d2d; border: 3px solid #ff5252; border-radius: 16px; padding: 40px; text-align: center; max-width: 400px; box-shadow: 0 0 40px rgba(255,82,82,0.3); }")
+    parts.append("  .disconnect-icon { font-size: 48px; margin-bottom: 16px; color: #ff5252; }")
+    parts.append("  .disconnect-title { font-size: 24px; font-weight: 700; color: #ff5252; margin-bottom: 12px; }")
+    parts.append("  .disconnect-message { font-size: 14px; color: #888888; margin-bottom: 20px; }")
+    parts.append("  .disconnect-status { font-size: 12px; color: #666666; }")
+    parts.append("</style>")
     parts.append("</head><body>")
+    # Disconnect overlay
+    parts.append('<div id="disconnect-overlay" class="disconnect-overlay">')
+    parts.append('<div class="disconnect-modal">')
+    parts.append('<div class="disconnect-icon">&#9888;</div>')
+    parts.append('<div class="disconnect-title">Connection Lost</div>')
+    parts.append('<div class="disconnect-message">The server has been closed or restarted.<br>Please restart the application to reconnect.</div>')
+    parts.append('<div class="disconnect-status" id="disconnect-status">Attempting to reconnect...</div>')
+    parts.append('</div>')
+    parts.append('</div>')
     parts.append(_nav_html())
-    parts.append('<div class="version-badge">v' + _runtime_version() + " • port " + str(effective_port()) + "</div>")
-    parts.append("<h1>Integrations</h1>")
-    parts.append("<p>Optional integrations for TfL and Singular Data Stream.</p>")
-    # Data stream
-    parts.append("<fieldset><legend>Singular Data Stream</legend>")
-    cur = html_escape(CONFIG.singular_stream_url or "not set")
-    parts.append("<p>Currently: <code>" + cur + "</code></p>")
-    parts.append("<p>Enabled in settings: <strong>" + ("Yes" if CONFIG.enable_datastream else "No") + "</strong></p>")
-    parts.append('<form id="stream-form">')
-    stream_val = html_escape(CONFIG.singular_stream_url or "")
-    parts.append('<label>Data Stream URL <input name="stream_url" value="' + stream_val + '" autocomplete="off" /></label>')
-    parts.append('<button type="submit">Save Data Stream URL</button>')
-    parts.append("</form></fieldset>")
-    # TfL
-    parts.append("<fieldset><legend>TfL API (optional)</legend>")
-    parts.append("<p>Enabled in settings: <strong>" + ("Yes" if CONFIG.enable_tfl else "No") + "</strong></p>")
-    parts.append('<form id="tfl-form">')
-    tfl_id = html_escape(CONFIG.tfl_app_id or "")
-    tfl_key = html_escape(CONFIG.tfl_app_key or "")
-    parts.append('<label>TfL App ID <input name="app_id" value="' + tfl_id + '" autocomplete="off" /></label>')
-    parts.append('<label>TfL App Key <input name="app_key" value="' + tfl_key + '" autocomplete="off" /></label>')
-    parts.append('<button type="submit">Save TfL Credentials</button>')
-    parts.append("</form></fieldset>")
-    # JS
-    parts.append("<script>")
-    parts.append("async function postJSON(url, data) {")
-    parts.append("  const res = await fetch(url, {")
-    parts.append('    method: "POST",')
-    parts.append('    headers: { "Content-Type": "application/json" },')
-    parts.append("    body: JSON.stringify(data),")
-    parts.append("  });")
-    parts.append("  return res.text();")
-    parts.append("}")
-    parts.append('document.getElementById("stream-form").onsubmit = async (e) => {')
-    parts.append("  e.preventDefault();")
-    parts.append("  const f = e.target;")
-    parts.append("  const stream_url = f.stream_url.value;")
-    parts.append('  await postJSON("/config/stream", { stream_url });')
-    parts.append("  alert('Data stream updated.');")
-    parts.append("};")
-    parts.append('document.getElementById("tfl-form").onsubmit = async (e) => {')
-    parts.append("  e.preventDefault();")
-    parts.append("  const f = e.target;")
-    parts.append("  const app_id = f.app_id.value;")
-    parts.append("  const app_key = f.app_key.value;")
-    parts.append('  await postJSON("/config/tfl", { app_id, app_key });')
-    parts.append("  alert('TfL config updated.');")
-    parts.append("};")
-    parts.append("</script>")
+    parts.append("<h1>Modules</h1>")
+    parts.append("<p>Enable and configure optional modules to extend functionality.</p>")
+
+    # TfL Status Module
+    tfl_enabled = "checked" if CONFIG.enable_tfl else ""
+    auto_refresh = "checked" if CONFIG.tfl_auto_refresh else ""
+    stream_url = html_escape(CONFIG.singular_stream_url or "")
+
+    parts.append('<fieldset class="module-card"><legend>TfL Line Status</legend>')
+    parts.append('<div class="module-header">')
+    parts.append('<p class="module-title">Transport for London - Line Status</p>')
+    parts.append('<label class="toggle-switch"><input type="checkbox" id="tfl-enabled" ' + tfl_enabled + ' onchange="toggleModule()" /><span class="toggle-slider"></span></label>')
+    parts.append('</div>')
+    parts.append('<p style="color: #8b949e; margin: 0;">Fetches current TfL line status and pushes to Singular Data Stream.</p>')
+
+    # TFL Content container (collapsible based on module toggle)
+    tfl_display = "block" if CONFIG.enable_tfl else "none"
+    parts.append(f'<div id="tfl-content" style="display: {tfl_display};">')
+
+    # Data Stream URL input
+    parts.append('<form id="stream-form" style="margin-top: 16px;">')
+    parts.append('<label>Data Stream URL (where to push TfL data)')
+    parts.append('<input name="stream_url" value="' + stream_url + '" placeholder="https://datastream.singular.live/datastreams/..." autocomplete="off" /></label>')
+    parts.append('</form>')
+
+    # Auto-refresh toggle (as toggle switch)
+    parts.append('<div style="margin-top: 16px; display: flex; align-items: center; gap: 12px;">')
+    parts.append('<span style="font-size: 14px;">Auto-refresh every 60 seconds</span>')
+    parts.append('<label class="toggle-switch"><input type="checkbox" id="auto-refresh" ' + auto_refresh + ' onchange="toggleAutoRefresh()" /><span class="toggle-slider"></span></label>')
+    parts.append('</div>')
+
+    # Action buttons and status (inline)
+    parts.append('<div class="module-actions" style="flex-wrap: wrap; align-items: center;">')
+    parts.append('<button type="button" onclick="saveAndRefresh()">Save & Update</button>')
+    parts.append('<button type="button" onclick="refreshTfl()" style="background: #30363d;">Update Now</button>')
+    parts.append('<button type="button" onclick="previewTfl()" style="background: #30363d;">Preview</button>')
+    parts.append('<button type="button" onclick="testTfl()" style="background: #f59e0b;">Send TEST</button>')
+    parts.append('<button type="button" onclick="blankTfl()" style="background: #ef4444;">Send Blank</button>')
+    parts.append('<span id="tfl-status" class="status-text idle" style="margin-left: 12px;">Not updated yet</span>')
+    parts.append('</div>')
+    parts.append('<pre id="tfl-preview" style="display: none; max-height: 200px; overflow: auto; margin-top: 12px;"></pre>')
+
+    # Manual TFL Input Section
+    parts.append('<div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #3d3d3d;">')
+    parts.append('<h3 style="margin: 0 0 16px 0; font-size: 16px; font-weight: 600;">Manual Line Status</h3>')
+    parts.append('<p style="color: #888888; margin: 0 0 16px 0; font-size: 13px;">Override individual line statuses. Empty fields default to "Good Service".</p>')
+    parts.append('<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 32px;">')
+
+    # Underground column
+    parts.append('<div>')
+    parts.append('<h4 style="margin: 0 0 12px 0; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: #888888; border-bottom: 2px solid #3d3d3d; padding-bottom: 8px;">Underground</h4>')
+    for line in TFL_UNDERGROUND:
+        safe_id = line.replace(" ", "-").replace("&", "and")
+        line_colour = TFL_LINE_COLOURS.get(line, "#3d3d3d")
+        parts.append(f'<div style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px;">')
+        parts.append(f'<div style="width: 130px; flex-shrink: 0;"><span style="display: block; font-size: 11px; padding: 8px 10px; border-radius: 4px; background: {line_colour}; color: #fff; font-weight: 600; text-align: center;">{html_escape(line)}</span></div>')
+        parts.append(f'<input type="text" id="manual-{safe_id}" placeholder="Good Service" style="flex: 1; padding: 8px 12px; font-size: 11px; background: #0c6473; color: #fff; border: none; border-radius: 4px; font-weight: 500;" oninput="updateStatusColour(this)" />')
+        parts.append('</div>')
+    parts.append('</div>')
+
+    # Overground column
+    parts.append('<div>')
+    parts.append('<h4 style="margin: 0 0 12px 0; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: #888888; border-bottom: 2px solid #3d3d3d; padding-bottom: 8px;">Overground & Other</h4>')
+    for line in TFL_OVERGROUND:
+        safe_id = line.replace(" ", "-").replace("&", "and")
+        line_colour = TFL_LINE_COLOURS.get(line, "#3d3d3d")
+        parts.append(f'<div style="display: flex; align-items: center; gap: 10px; margin-bottom: 8px;">')
+        parts.append(f'<div style="width: 130px; flex-shrink: 0;"><span style="display: block; font-size: 11px; padding: 8px 10px; border-radius: 4px; background: {line_colour}; color: #fff; font-weight: 600; text-align: center;">{html_escape(line)}</span></div>')
+        parts.append(f'<input type="text" id="manual-{safe_id}" placeholder="Good Service" style="flex: 1; padding: 8px 12px; font-size: 11px; background: #0c6473; color: #fff; border: none; border-radius: 4px; font-weight: 500;" oninput="updateStatusColour(this)" />')
+        parts.append('</div>')
+    parts.append('</div>')
+
+    parts.append('</div>')  # Close grid
+    parts.append('<div class="module-actions" style="margin-top: 16px; align-items: center;">')
+    parts.append('<button type="button" onclick="sendManual()">Send Manual</button>')
+    parts.append('<button type="button" onclick="resetManual()" style="background: #3d3d3d;">Reset All</button>')
+    parts.append('<span id="manual-status" class="status-text idle" style="margin-left: 12px;">Not sent yet</span>')
+    parts.append('</div>')
+    parts.append('</div>')  # Close manual section
+    parts.append('</div>')  # Close tfl-content
+    parts.append('</fieldset>')  # Close TfL fieldset
+
+    # Future modules placeholder
+    parts.append('<fieldset style="opacity: 0.6;"><legend>More Modules Coming Soon</legend>')
+    parts.append('<p style="color: #8b949e;">Additional modules will be available in future updates.</p>')
+    parts.append('</fieldset>')
+
+    # JavaScript - use a list and join with newlines
+    js_lines = [
+        "<script>",
+        "let autoRefreshInterval = null;",
+        "",
+        "async function postJSON(url, data) {",
+        "  const res = await fetch(url, {",
+        '    method: "POST",',
+        '    headers: { "Content-Type": "application/json" },',
+        "    body: JSON.stringify(data),",
+        "  });",
+        "  return res.json();",
+        "}",
+        "",
+        "async function toggleModule() {",
+        '  const enabled = document.getElementById("tfl-enabled").checked;',
+        '  const content = document.getElementById("tfl-content");',
+        '  await postJSON("/config/module/tfl", { enabled });',
+        "  if (enabled) {",
+        '    content.style.display = "block";',
+        "  } else {",
+        '    content.style.display = "none";',
+        "    stopAutoRefresh();",
+        "  }",
+        "}",
+        "",
+        "async function toggleAutoRefresh() {",
+        '  const enabled = document.getElementById("auto-refresh").checked;',
+        '  await postJSON("/config/module/tfl/auto-refresh", { enabled });',
+        "  if (enabled) { startAutoRefresh(); } else { stopAutoRefresh(); }",
+        "}",
+        "",
+        "function startAutoRefresh() {",
+        "  if (autoRefreshInterval) return;",
+        "  autoRefreshInterval = setInterval(refreshTfl, 60000);",
+        '  console.log("Auto-refresh started");',
+        "}",
+        "",
+        "function stopAutoRefresh() {",
+        "  if (autoRefreshInterval) { clearInterval(autoRefreshInterval); autoRefreshInterval = null; }",
+        '  console.log("Auto-refresh stopped");',
+        "}",
+        "",
+        "async function saveAndRefresh() {",
+        '  const streamUrl = document.querySelector("[name=stream_url]").value;',
+        '  await postJSON("/config/stream", { stream_url: streamUrl });',
+        "  await refreshTfl();",
+        "}",
+        "",
+        "async function refreshTfl() {",
+        '  const status = document.getElementById("tfl-status");',
+        '  status.textContent = "Refreshing...";',
+        '  status.className = "status-text idle";',
+        "  try {",
+        '    const res = await fetch("/update");',
+        '    const autoOn = document.getElementById("auto-refresh").checked;',
+        '    const autoText = autoOn ? " (auto-refresh on)" : "";',
+        "    if (res.ok) {",
+        '      status.textContent = "Updated " + new Date().toLocaleTimeString() + autoText;',
+        '      status.className = "status-text success";',
+        "    } else {",
+        "      const err = await res.json();",
+        '      status.textContent = err.detail || "Error";',
+        '      status.className = "status-text error";',
+        "    }",
+        "  } catch (e) {",
+        '    status.textContent = "Failed: " + e.message;',
+        '    status.className = "status-text error";',
+        "  }",
+        "}",
+        "",
+        "async function previewTfl() {",
+        '  const preview = document.getElementById("tfl-preview");',
+        '  const status = document.getElementById("tfl-status");',
+        '  status.textContent = "Fetching preview...";',
+        '  status.className = "status-text idle";',
+        "  try {",
+        '    const res = await fetch("/status");',
+        "    const data = await res.json();",
+        '    preview.textContent = JSON.stringify(data, null, 2);',
+        '    preview.style.display = "block";',
+        '    status.textContent = "Preview loaded (not sent)";',
+        '    status.className = "status-text idle";',
+        "  } catch (e) {",
+        '    status.textContent = "Preview failed: " + e.message;',
+        '    status.className = "status-text error";',
+        "  }",
+        "}",
+        "",
+        "async function testTfl() {",
+        '  const status = document.getElementById("tfl-status");',
+        '  status.textContent = "Sending TEST...";',
+        '  status.className = "status-text idle";',
+        "  try {",
+        '    const res = await fetch("/test");',
+        "    if (res.ok) {",
+        '      status.textContent = "TEST sent " + new Date().toLocaleTimeString();',
+        '      status.className = "status-text success";',
+        "    } else {",
+        "      const err = await res.json();",
+        '      status.textContent = err.detail || "Error";',
+        '      status.className = "status-text error";',
+        "    }",
+        "  } catch (e) {",
+        '    status.textContent = "Failed: " + e.message;',
+        '    status.className = "status-text error";',
+        "  }",
+        "}",
+        "",
+        "async function blankTfl() {",
+        '  const status = document.getElementById("tfl-status");',
+        '  status.textContent = "Sending blank...";',
+        '  status.className = "status-text idle";',
+        "  try {",
+        '    const res = await fetch("/blank");',
+        "    if (res.ok) {",
+        '      status.textContent = "Blank sent " + new Date().toLocaleTimeString();',
+        '      status.className = "status-text success";',
+        "    } else {",
+        "      const err = await res.json();",
+        '      status.textContent = err.detail || "Error";',
+        '      status.className = "status-text error";',
+        "    }",
+        "  } catch (e) {",
+        '    status.textContent = "Failed: " + e.message;',
+        '    status.className = "status-text error";',
+        "  }",
+        "}",
+        "",
+        "const TFL_LINES = " + json.dumps(TFL_LINES) + ";",
+        "",
+        "function updateStatusColour(input) {",
+        "  var value = input.value.trim().toLowerCase();",
+        '  if (value === "" || value === "good service") {',
+        '    input.style.background = "#0c6473";',  # Teal for Good Service
+        "  } else {",
+        '    input.style.background = "#db422d";',  # Red for anything else
+        "  }",
+        "}",
+        "",
+        "function getManualPayload() {",
+        "  const payload = {};",
+        "  TFL_LINES.forEach(line => {",
+        '    const safeId = line.replace(/ /g, "-").replace(/&/g, "and");',
+        '    const input = document.getElementById("manual-" + safeId);',
+        '    const value = input ? input.value.trim() : "";',
+        '    payload[line] = value || "Good Service";',
+        "  });",
+        "  return payload;",
+        "}",
+        "",
+        "async function sendManual() {",
+        '  var status = document.getElementById("manual-status");',
+        '  status.textContent = "Sending...";',
+        '  status.className = "status-text idle";',
+        "  try {",
+        "    var payload = getManualPayload();",
+        '    var res = await fetch("/manual", {',
+        '      method: "POST",',
+        '      headers: { "Content-Type": "application/json" },',
+        "      body: JSON.stringify(payload)",
+        "    });",
+        "    if (res.ok) {",
+        '      status.textContent = "Updated " + new Date().toLocaleTimeString();',
+        '      status.className = "status-text success";',
+        "    } else {",
+        "      var err = await res.json();",
+        '      status.textContent = err.detail || "Error";',
+        '      status.className = "status-text error";',
+        "    }",
+        "  } catch (e) {",
+        '    status.textContent = "Failed: " + e.message;',
+        '    status.className = "status-text error";',
+        "  }",
+        "}",
+        "",
+        "function resetManual() {",
+        "  TFL_LINES.forEach(line => {",
+        '    const safeId = line.replace(/ /g, "-").replace(/&/g, "and");',
+        '    const input = document.getElementById("manual-" + safeId);',
+        "    if (input) {",
+        '      input.value = "";',
+        '      input.style.background = "#0c6473";',  # Reset to teal background
+        "    }",
+        "  });",
+        '  document.getElementById("manual-status").textContent = "Reset";',
+        '  document.getElementById("manual-status").className = "status-text idle";',
+        "}",
+    ]
+    parts.append("\n".join(js_lines))
+
+    # Auto-refresh init code - also join with newlines
+    init_js = [
+        "",
+        "// Connection monitoring",
+        "let connectionLost = false;",
+        "let reconnectAttempts = 0;",
+        "",
+        "async function checkConnection() {",
+        "  try {",
+        '    const res = await fetch("/health", { method: "GET", cache: "no-store" });',
+        "    if (res.ok) {",
+        "      if (connectionLost) {",
+        "        // Reconnected - reload page to refresh state",
+        "        location.reload();",
+        "      }",
+        "      reconnectAttempts = 0;",
+        "      return true;",
+        "    }",
+        "  } catch (e) {",
+        "    // Connection failed",
+        "  }",
+        "  return false;",
+        "}",
+        "",
+        "async function monitorConnection() {",
+        "  const connected = await checkConnection();",
+        "  if (!connected) {",
+        "    connectionLost = true;",
+        "    reconnectAttempts++;",
+        '    const overlay = document.getElementById("disconnect-overlay");',
+        '    const status = document.getElementById("disconnect-status");',
+        '    overlay.style.display = "flex";',
+        '    overlay.classList.add("active");',
+        '    status.textContent = "Reconnect attempt " + reconnectAttempts + "...";',
+        "  }",
+        "}",
+        "",
+        "// Check connection every 3 seconds",
+        "setInterval(monitorConnection, 3000);",
+        "",
+        "// Start auto-refresh if enabled on page load",
+        'const autoRefreshChecked = document.getElementById("auto-refresh").checked;',
+        'const tflEnabledChecked = document.getElementById("tfl-enabled").checked;',
+        'console.log("Auto-refresh checkbox:", autoRefreshChecked, "TFL enabled:", tflEnabledChecked);',
+        'if (autoRefreshChecked && tflEnabledChecked) {',
+        '  console.log("Starting auto-refresh on page load");',
+        "  startAutoRefresh();",
+        "} else {",
+        '  console.log("Auto-refresh NOT started - conditions not met");',
+        "}",
+        "</script>",
+    ]
+    parts.append("\n".join(init_js))
     parts.append("</body></html>")
     return HTMLResponse("".join(parts))
+
+
+# Keep old route for backwards compatibility
+@app.get("/integrations", response_class=HTMLResponse)
+def integrations_redirect():
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/modules")
 
 
 @app.get("/commands", response_class=HTMLResponse)
@@ -994,16 +1497,16 @@ def commands_page(request: Request):
     base = _base_url(request)
     parts: List[str] = []
     parts.append("<html><head>")
-    parts.append("<title>Commands - Singular Tweaks</title>")
+    parts.append("<title>Commands - Elliott's Singular Controls</title>")
     parts.append(_base_style())
     parts.append("</head><body>")
     parts.append(_nav_html())
-    parts.append('<div class="version-badge">v' + _runtime_version() + " • port " + str(effective_port()) + "</div>")
     parts.append("<h1>Singular Commands</h1>")
     parts.append("<p>This view focuses on simple <strong>GET</strong> triggers you can use in automation systems.</p>")
     parts.append("<p>Base URL: <code>" + html_escape(base) + "</code></p>")
     parts.append("<fieldset><legend>Discovered Subcompositions</legend>")
-    parts.append('<p><button type="button" onclick="loadCommands()">Reload Commands</button></p>')
+    parts.append('<p><button type="button" onclick="loadCommands()">Reload Commands</button>')
+    parts.append('<button type="button" onclick="rebuildRegistry()">Rebuild from Singular</button></p>')
     parts.append('<div style="margin-bottom:0.5rem;">')
     parts.append('<label>Filter <input id="cmd-filter" placeholder="Filter by name or key" /></label>')
     parts.append('<label>Sort <select id="cmd-sort">')
@@ -1034,21 +1537,35 @@ def commands_page(request: Request):
     parts.append("  let html = '';")
     parts.append("  for (const [key, item] of entries) {")
     parts.append("    html += '<h3>' + item.name + ' <small>(' + key + ')</small></h3>';")
-    parts.append("    html += '<table><tr><th>Action</th><th>GET URL</th><th>Test</th></tr>';")
+    parts.append("    html += '<table><tr><th>Action</th><th>GET URL</th><th style=\"width:60px;text-align:center;\">Test</th></tr>';")
     parts.append("    html += '<tr><td>IN</td><td><code>' + item.in_url + '</code></td>' +")
-    parts.append("            '<td><a href=\"' + item.in_url + '\" target=\"_blank\">Open</a></td></tr>';")
+    parts.append("            '<td style=\"text-align:center;\"><a href=\"' + item.in_url + '\" target=\"_blank\" class=\"play-btn\" title=\"Test IN\">▶</a></td></tr>';")
     parts.append("    html += '<tr><td>OUT</td><td><code>' + item.out_url + '</code></td>' +")
-    parts.append("            '<td><a href=\"' + item.out_url + '\" target=\"_blank\">Open</a></td></tr>';")
+    parts.append("            '<td style=\"text-align:center;\"><a href=\"' + item.out_url + '\" target=\"_blank\" class=\"play-btn\" title=\"Test OUT\">▶</a></td></tr>';")
     parts.append("    html += '</table>';")
     parts.append("    const fields = item.fields || {};")
     parts.append("    const fkeys = Object.keys(fields);")
     parts.append("    if (fkeys.length) {")
     parts.append("      html += '<p><strong>Fields:</strong></p>';")
-    parts.append("      html += '<table><tr><th>Field</th><th>Example GET</th></tr>';")
+    parts.append("      html += '<table><tr><th>Field</th><th>Type</th><th>Command URL</th><th style=\"width:60px;text-align:center;\">Test</th></tr>';")
     parts.append("      for (const fid of fkeys) {")
     parts.append("        const ex = fields[fid];")
-    parts.append("        if (ex.set_url) {")
-    parts.append("          html += '<tr><td>' + fid + '</td><td><code>' + ex.set_url + '</code></td></tr>';")
+    parts.append("        if (ex.timecontrol_start_url) {")
+    parts.append("          html += '<tr><td rowspan=\"3\">' + fid + '</td><td rowspan=\"3\">⏱ Timer</td>';")
+    parts.append("          html += '<td><code>' + ex.timecontrol_start_url + '</code></td>';")
+    parts.append("          html += '<td style=\"text-align:center;\"><a href=\"' + ex.timecontrol_start_url + '\" target=\"_blank\" class=\"play-btn\" title=\"Start Timer\">▶</a></td></tr>';")
+    parts.append("          html += '<tr><td><code>' + ex.timecontrol_stop_url + '</code></td>';")
+    parts.append("          html += '<td style=\"text-align:center;\"><a href=\"' + ex.timecontrol_stop_url + '\" target=\"_blank\" class=\"play-btn\" title=\"Stop Timer\">▶</a></td></tr>';")
+    parts.append("          if (ex.start_10s_if_supported) {")
+    parts.append("            html += '<tr><td><code>' + ex.start_10s_if_supported + '</code></td>';")
+    parts.append("            html += '<td style=\"text-align:center;\"><a href=\"' + ex.start_10s_if_supported + '\" target=\"_blank\" class=\"play-btn\" title=\"Start 10s\">▶</a></td></tr>';")
+    parts.append("          } else {")
+    parts.append("            html += '<tr><td colspan=\"2\" style=\"color:#666;\">Duration param not supported</td></tr>';")
+    parts.append("          }")
+    parts.append("        } else if (ex.set_url) {")
+    parts.append("          html += '<tr><td>' + fid + '</td><td>Value</td>';")
+    parts.append("          html += '<td><code>' + ex.set_url + '</code></td>';")
+    parts.append("          html += '<td style=\"text-align:center;\"><a href=\"' + ex.set_url + '\" target=\"_blank\" class=\"play-btn\" title=\"Set Value\">▶</a></td></tr>';")
     parts.append("        }")
     parts.append("      }")
     parts.append("      html += '</table>';")
@@ -1071,6 +1588,18 @@ def commands_page(request: Request):
     parts.append("    renderCommands();")
     parts.append("  } catch (e) { container.textContent = 'Error: ' + e; }")
     parts.append("}")
+    parts.append("async function rebuildRegistry() {")
+    parts.append('  const container = document.getElementById("commands");')
+    parts.append("  container.textContent = 'Rebuilding from Singular...';")
+    parts.append("  try {")
+    parts.append('    const res = await fetch("/singular/refresh", { method: "POST" });')
+    parts.append("    const data = await res.json();")
+    parts.append("    if (data.count !== undefined) {")
+    parts.append("      container.textContent = 'Rebuilt: ' + data.count + ' subcompositions found. Reloading...';")
+    parts.append("      setTimeout(loadCommands, 500);")
+    parts.append("    } else { container.textContent = 'Rebuild failed'; }")
+    parts.append("  } catch (e) { container.textContent = 'Error: ' + e; }")
+    parts.append("}")
     parts.append("document.addEventListener('DOMContentLoaded', () => {")
     parts.append('  document.getElementById("cmd-filter").addEventListener("input", renderCommands);')
     parts.append('  document.getElementById("cmd-sort").addEventListener("change", renderCommands);')
@@ -1085,25 +1614,33 @@ def commands_page(request: Request):
 def settings_page():
     parts: List[str] = []
     parts.append("<html><head>")
-    parts.append("<title>Settings - Singular Tweaks</title>")
+    parts.append("<title>Settings - Elliott's Singular Controls</title>")
     parts.append(_base_style())
     parts.append("</head><body>")
     parts.append(_nav_html())
-    parts.append('<div class="version-badge">v' + _runtime_version() + " • port " + str(effective_port()) + "</div>")
     parts.append("<h1>Settings</h1>")
+    # Theme toggle styles
+    parts.append("<style>")
+    parts.append("  .theme-toggle { display: flex; align-items: center; gap: 12px; margin: 16px 0; }")
+    parts.append("  .theme-toggle-label { font-size: 14px; min-width: 50px; }")
+    parts.append("  .toggle-switch { position: relative; width: 50px; height: 26px; }")
+    parts.append("  .toggle-switch input { opacity: 0; width: 0; height: 0; }")
+    parts.append("  .toggle-slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background: #30363d; border-radius: 26px; transition: 0.3s; }")
+    parts.append("  .toggle-slider:before { position: absolute; content: ''; height: 20px; width: 20px; left: 3px; bottom: 3px; background: white; border-radius: 50%; transition: 0.3s; }")
+    parts.append("  .toggle-switch input:checked + .toggle-slider { background: #00bcd4; }")
+    parts.append("  .toggle-switch input:checked + .toggle-slider:before { transform: translateX(24px); }")
+    parts.append("</style>")
     # General
     parts.append("<fieldset><legend>General</legend>")
-    parts.append('<form id="settings-form">')
-    parts.append('<label><input type="checkbox" id="enable-tfl" ' + ('checked' if CONFIG.enable_tfl else '') + ' /> Enable TfL integration</label>')
-    parts.append('<label><input type="checkbox" id="enable-ds" ' + ('checked' if CONFIG.enable_datastream else '') + ' /> Enable Data Stream integration</label>')
-    parts.append('<label>Theme <select id="theme-select">')
-    parts.append('<option value="dark"' + (' selected' if CONFIG.theme == 'dark' else '') + ">Dark</option>")
-    parts.append('<option value="light"' + (' selected' if CONFIG.theme == 'light' else '') + ">Light</option>")
-    parts.append("</select></label>")
-    parts.append('<button type="submit">Save Settings</button>')
-    parts.append("</form>")
-    parts.append("<p><strong>Note:</strong> Port configuration has been moved to the GUI launcher.</p>")
-    parts.append("<p>Config file: <code>" + html_escape(str(CONFIG_PATH)) + "</code></p>")
+    is_light = CONFIG.theme == 'light'
+    parts.append('<div class="theme-toggle">')
+    parts.append('<span class="theme-toggle-label">Dark</span>')
+    parts.append('<label class="toggle-switch"><input type="checkbox" id="theme-toggle" ' + ('checked' if is_light else '') + ' onchange="toggleTheme()" /><span class="toggle-slider"></span></label>')
+    parts.append('<span class="theme-toggle-label">Light</span>')
+    parts.append('</div>')
+    parts.append("<p><strong>Server Port:</strong> <code>" + str(effective_port()) + "</code> (change via GUI launcher)</p>")
+    parts.append("<p><strong>Version:</strong> <code>" + _runtime_version() + "</code></p>")
+    parts.append("<p><strong>Config file:</strong> <code>" + html_escape(str(CONFIG_PATH)) + "</code></p>")
     parts.append("</fieldset>")
     # Config Import/Export
     parts.append("<fieldset><legend>Config Backup</legend>")
@@ -1129,15 +1666,12 @@ def settings_page():
     parts.append("  });")
     parts.append("  return res.json();")
     parts.append("}")
-    parts.append('document.getElementById("settings-form").onsubmit = async (e) => {')
-    parts.append("  e.preventDefault();")
-    parts.append('  const enable_tfl = document.getElementById("enable-tfl").checked;')
-    parts.append('  const enable_datastream = document.getElementById("enable-ds").checked;')
-    parts.append('  const theme = document.getElementById("theme-select").value || "dark";')
-    parts.append('  const data = await postJSON("/settings", { port: null, enable_tfl, enable_datastream, theme });')
-    parts.append("  alert(data.message || 'Settings saved.');")
+    parts.append("async function toggleTheme() {")
+    parts.append('  const isLight = document.getElementById("theme-toggle").checked;')
+    parts.append('  const theme = isLight ? "light" : "dark";')
+    parts.append('  await postJSON("/settings", { theme });')
     parts.append("  location.reload();")
-    parts.append("};")
+    parts.append("}")
     parts.append("async function checkUpdates() {")
     parts.append('  const out = document.getElementById("update-output");')
     parts.append('  out.textContent = "Checking for updates...";')
@@ -1165,7 +1699,7 @@ def settings_page():
     parts.append("    const url = URL.createObjectURL(blob);")
     parts.append("    const a = document.createElement('a');")
     parts.append("    a.href = url;")
-    parts.append("    a.download = 'singular_tweaks_config.json';")
+    parts.append("    a.download = 'esc_config.json';")
     parts.append("    a.click();")
     parts.append("    URL.revokeObjectURL(url);")
     parts.append('    document.getElementById("import-output").textContent = "Config exported successfully!";')
@@ -1222,7 +1756,7 @@ def main():
     import uvicorn
     port = effective_port()
     logger.info(
-        "Starting Singular Tweaks v%s on http://localhost:%s (binding 0.0.0.0)",
+        "Starting Elliott's Singular Controls v%s on http://localhost:%s (binding 0.0.0.0)",
         _runtime_version(),
         port
     )
