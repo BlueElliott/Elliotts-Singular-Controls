@@ -8,23 +8,29 @@ try:
 except ImportError:
     from PyInstaller.building.api import Analysis, EXE, PYZ
 
+# Get the repo root (parent of scripts/ folder where this spec file lives)
+SPEC_DIR = os.path.dirname(os.path.abspath(SPECPATH))
+REPO_ROOT = os.path.dirname(SPEC_DIR)
+
 # Get version from package
-sys.path.insert(0, os.path.abspath('.'))
+sys.path.insert(0, REPO_ROOT)
 try:
     from elliotts_singular_controls import __version__
     VERSION = __version__
 except:
-    VERSION = "1.0.14"
+    VERSION = "1.0.15"
 
 # Build data files list
 datas = []
-if os.path.exists('static'):
-    datas.append(('static', 'static'))
-if os.path.exists('README.md'):
-    datas.append(('README.md', '.'))
+static_path = os.path.join(REPO_ROOT, 'static')
+readme_path = os.path.join(REPO_ROOT, 'README.md')
+if os.path.exists(static_path):
+    datas.append((static_path, 'static'))
+if os.path.exists(readme_path):
+    datas.append((readme_path, '.'))
 
 a = Analysis(
-    ['elliotts_singular_controls/__main__.py'],
+    [os.path.join(REPO_ROOT, 'elliotts_singular_controls/__main__.py')],
     pathex=[],
     binaries=[],
     datas=datas,
@@ -75,5 +81,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='static/esc_icon.ico',
+    icon=os.path.join(REPO_ROOT, 'static/esc_icon.ico'),
 )
