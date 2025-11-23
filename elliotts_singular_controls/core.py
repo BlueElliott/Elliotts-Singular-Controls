@@ -1144,7 +1144,7 @@ def modules_page():
     parts.append("  .tfl-row { display: flex; align-items: stretch; margin-bottom: 6px; border-radius: 6px; overflow: hidden; background: #252525; }")
     parts.append("  .tfl-label { width: 140px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; padding: 12px 8px; }")
     parts.append("  .tfl-label span { font-size: 11px; font-weight: 600; text-align: center; line-height: 1.2; }")
-    parts.append("  input.tfl-input { flex: 1 !important; padding: 12px 14px !important; font-size: 12px !important; background: #0c6473 !important; color: #fff !important; border: none !important; font-weight: 500 !important; outline: none !important; font-family: inherit !important; width: auto !important; margin: 0 !important; border-radius: 0 !important; }")
+    parts.append("  input.tfl-input { flex: 1 !important; padding: 12px 14px !important; font-size: 12px !important; background: #0c6473; color: #fff !important; border: none !important; font-weight: 500 !important; outline: none !important; font-family: inherit !important; width: auto !important; margin: 0 !important; border-radius: 0 !important; }")
     parts.append("  input.tfl-input::placeholder { color: rgba(255,255,255,0.5) !important; }")
     parts.append("</style>")
     parts.append("</head><body>")
