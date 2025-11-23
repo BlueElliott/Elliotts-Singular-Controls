@@ -284,16 +284,12 @@ class SingularTweaksGUI:
         status_frame = tk.Frame(content_frame, bg=self.bg_dark)
         status_frame.pack(pady=(0, 5))
 
-        # Pulse indicator canvas
-        self.pulse_canvas = tk.Canvas(
-            status_frame,
-            width=20,
-            height=20,
-            bg=self.bg_dark,
-            highlightthickness=0
-        )
-        self.pulse_canvas.pack(side=tk.LEFT, padx=(0, 8))
-        self.pulse_circle = self.pulse_canvas.create_oval(4, 4, 16, 16, fill=self.text_gray, outline="")
+        # Pulse indicator using PIL for anti-aliased smooth graphics
+        self.pulse_size = 40
+        self.pulse_scale = 4  # Draw at 4x resolution for anti-aliasing
+        self.pulse_label = tk.Label(status_frame, bg=self.bg_dark, bd=0, highlightthickness=0)
+        self.pulse_label.pack(side=tk.LEFT, padx=(0, 8))
+        self.pulse_image = None  # Will hold PhotoImage reference
 
         # Status message
         self.status_label = tk.Label(
@@ -379,13 +375,14 @@ class SingularTweaksGUI:
         self.root.after(500, self.start_server)
 
     def _draw_rounded_rect(self, canvas, x1, y1, x2, y2, radius, fill):
-        """Draw a rounded rectangle on canvas."""
-        canvas.create_oval(x1, y1, x1 + radius*2, y1 + radius*2, fill=fill, outline="")
-        canvas.create_oval(x2 - radius*2, y1, x2, y1 + radius*2, fill=fill, outline="")
-        canvas.create_oval(x1, y2 - radius*2, x1 + radius*2, y2, fill=fill, outline="")
-        canvas.create_oval(x2 - radius*2, y2 - radius*2, x2, y2, fill=fill, outline="")
-        canvas.create_rectangle(x1 + radius, y1, x2 - radius, y2, fill=fill, outline="")
-        canvas.create_rectangle(x1, y1 + radius, x2, y2 - radius, fill=fill, outline="")
+        """Draw a rounded rectangle on canvas with smooth edges."""
+        # Use outline=fill to eliminate seam lines between shapes
+        canvas.create_oval(x1, y1, x1 + radius*2, y1 + radius*2, fill=fill, outline=fill)
+        canvas.create_oval(x2 - radius*2, y1, x2, y1 + radius*2, fill=fill, outline=fill)
+        canvas.create_oval(x1, y2 - radius*2, x1 + radius*2, y2, fill=fill, outline=fill)
+        canvas.create_oval(x2 - radius*2, y2 - radius*2, x2, y2, fill=fill, outline=fill)
+        canvas.create_rectangle(x1 + radius, y1, x2 - radius, y2, fill=fill, outline=fill)
+        canvas.create_rectangle(x1, y1 + radius, x2, y2 - radius, fill=fill, outline=fill)
 
     def _handle_port_card_click(self, event):
         """Handle clicks on the port card canvas."""
@@ -394,21 +391,91 @@ class SingularTweaksGUI:
             self.change_port()
 
     def _update_pulse(self):
-        """Update the pulse indicator animation."""
+        """Update the pulse indicator animation with smooth anti-aliased PIL rendering."""
+        import math
+        from PIL import Image, ImageDraw
+        from PIL import ImageTk
+
+        # Create high-res image for anti-aliasing
+        size = self.pulse_size
+        scale = self.pulse_scale
+        big_size = size * scale
+
+        # Background color must match exactly: #1a1a1a = rgb(26, 26, 26)
+        bg_color = (26, 26, 26)
+
+        # Blue color for active state: rgb(33, 150, 243)
+        blue_r, blue_g, blue_b = 80, 180, 255
+
         if self.server_running:
-            # Pulsing animation - oscillate between bright and dim
-            self.pulse_angle = (self.pulse_angle + 10) % 360
-            import math
-            brightness = int(127 + 127 * math.sin(math.radians(self.pulse_angle)))
-            # Interpolate between dim teal and bright teal
-            r = int(0 + (0 - 0) * brightness / 255)
-            g = int(100 + (188 - 100) * brightness / 255)
-            b = int(120 + (212 - 120) * brightness / 255)
-            color = f"#{r:02x}{g:02x}{b:02x}"
-            self.pulse_canvas.itemconfig(self.pulse_circle, fill=color)
+            # Animate - ripple flows outward from center
+            self.pulse_angle = (self.pulse_angle + 8) % 360
+
+            # Each element is phase-offset so the pulse ripples outward (center leads)
+            # Using 90 degree offsets for clear wave propagation
+            center_phase = self.pulse_angle
+            inner_phase = self.pulse_angle - 90
+            outer_phase = self.pulse_angle - 180
+
+            # Calculate opacity (0 to 1) for each element - true 0% to 100% fade
+            center_opacity = (math.sin(math.radians(center_phase)) + 1) / 2
+            inner_opacity = (math.sin(math.radians(inner_phase)) + 1) / 2
+            outer_opacity = (math.sin(math.radians(outer_phase)) + 1) / 2
+
+            # Blend colors with background based on opacity (simulates transparency)
+            def blend(opacity):
+                return (
+                    int(bg_color[0] + (blue_r - bg_color[0]) * opacity),
+                    int(bg_color[1] + (blue_g - bg_color[1]) * opacity),
+                    int(bg_color[2] + (blue_b - bg_color[2]) * opacity)
+                )
+
+            center_color = blend(center_opacity)
+            inner_color = blend(inner_opacity)
+            outer_color = blend(outer_opacity)
         else:
-            self.pulse_canvas.itemconfig(self.pulse_circle, fill=self.text_gray)
-        self.root.after(50, self._update_pulse)
+            # Server not running - gray static
+            gray = (100, 100, 100)
+            center_color = gray
+            inner_color = gray
+            outer_color = gray
+
+        # Create image at high resolution
+        img = Image.new('RGB', (big_size, big_size), bg_color)
+        draw = ImageDraw.Draw(img)
+
+        cx, cy = big_size // 2, big_size // 2
+
+        # Draw outer ring (scaled up)
+        outer_radius = 18 * scale
+        ring_width = 3 * scale
+        draw.ellipse(
+            [cx - outer_radius, cy - outer_radius, cx + outer_radius, cy + outer_radius],
+            outline=outer_color, width=ring_width
+        )
+
+        # Draw inner ring
+        inner_radius = 11 * scale
+        draw.ellipse(
+            [cx - inner_radius, cy - inner_radius, cx + inner_radius, cy + inner_radius],
+            outline=inner_color, width=ring_width
+        )
+
+        # Draw center dot (filled)
+        center_radius = 5 * scale
+        draw.ellipse(
+            [cx - center_radius, cy - center_radius, cx + center_radius, cy + center_radius],
+            fill=center_color
+        )
+
+        # Resize down with anti-aliasing (LANCZOS provides smooth downsampling)
+        img = img.resize((size, size), Image.LANCZOS)
+
+        # Convert to PhotoImage and display
+        self.pulse_image = ImageTk.PhotoImage(img)
+        self.pulse_label.configure(image=self.pulse_image)
+
+        self.root.after(40, self._update_pulse)
 
     def _update_runtime(self):
         """Update the runtime display."""
@@ -580,6 +647,15 @@ class SingularTweaksGUI:
             import logging
             from elliotts_singular_controls.core import app, effective_port
 
+            # Custom filter to exclude health check requests from access log
+            class HealthCheckFilter(logging.Filter):
+                def filter(self, record):
+                    message = record.getMessage()
+                    # Filter out health check and events polling requests
+                    if '/health' in message or '/events' in message or '/config' in message:
+                        return False
+                    return True
+
             # Configure basic logging to avoid uvicorn formatter errors
             logging.basicConfig(
                 level=logging.INFO,
@@ -587,6 +663,10 @@ class SingularTweaksGUI:
                 datefmt='%H:%M:%S',
                 force=True
             )
+
+            # Add filter to uvicorn access logger
+            uvicorn_access_logger = logging.getLogger("uvicorn.access")
+            uvicorn_access_logger.addFilter(HealthCheckFilter())
 
             # Configure uvicorn with custom logging and access log enabled
             config = uvicorn.Config(

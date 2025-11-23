@@ -14,7 +14,7 @@ try:
     from elliotts_singular_controls import __version__
     VERSION = __version__
 except:
-    VERSION = "1.0.15"
+    VERSION = "1.1.0"
 
 # Build data files list
 datas = []

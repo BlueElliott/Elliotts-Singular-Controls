@@ -1,216 +1,245 @@
-# Singular Tweaks
+# Elliott's Singular Controls
 
-> **Python tools and tweaks for controlling Singular.live with optional TfL integration**
+> **A premium desktop application for controlling Singular.live graphics with TfL integration**
 
-[![Build Status](https://github.com/BlueElliott/Singular-Tweaks/actions/workflows/build.yml/badge.svg)](https://github.com/BlueElliott/Singular-Tweaks/actions)
-[![PyPI version](https://badge.fury.io/py/singular-tweaks.svg)](https://pypi.org/project/singular-tweaks/)
+[![Build Status](https://github.com/BlueElliott/Elliotts-Singular-Controls/actions/workflows/build.yml/badge.svg)](https://github.com/BlueElliott/Elliotts-Singular-Controls/actions)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 A helper UI and HTTP API that makes it easy to control Singular.live compositions via simple HTTP GET requests. Perfect for integration with automation systems, OBS, vMix, Companion, and other broadcast tools.
 
-## ✨ Features
+## Features
 
-- 🎨 **Web-based Control Panel** - Configure and test your Singular compositions
-- 🔗 **Simple HTTP API** - Trigger compositions with GET requests
-- 🚇 **TfL Integration** - Fetch and display London transport statuses
-- 📊 **Data Stream Support** - Send data to Singular's Data Stream
-- 🎯 **Easy Setup** - No coding required for basic usage
-- 🔄 **Auto-discovery** - Automatically finds all your Singular subcompositions
+- **Web-based Control Panel** - Configure and test your Singular compositions
+- **Simple HTTP API** - Trigger compositions with GET requests
+- **TfL Integration** - Fetch and display London transport statuses with official branding
+- **Data Stream Support** - Send data to Singular's Data Stream
+- **Multi-Token Support** - Manage multiple Singular Control App tokens
+- **Desktop GUI** - Native Windows application with system tray support
+- **Connection Monitoring** - Auto-reconnect overlay when server connection is lost
 
-## 📦 Installation
+## Installation
 
 ### Windows (Recommended)
 
-**Option 1: Installer (Easiest)**
-1. Download `SingularTweaks-Setup-vX.X.X.exe` from [Releases](https://github.com/BlueElliott/Singular-Tweaks/releases)
-2. Run the installer (no admin rights needed)
-3. Launch from Start Menu or Desktop shortcut
-
-**Option 2: Standalone Executable**
-1. Download `SingularTweaks.exe` from [Releases](https://github.com/BlueElliott/Singular-Tweaks/releases)
-2. Double-click to run
-3. Open browser to `http://localhost:3113`
+**Portable Executable (Easiest)**
+1. Download `ElliottsSingularControls-1.1.0.exe` from [Releases](https://github.com/BlueElliott/Elliotts-Singular-Controls/releases)
+2. Double-click to run - no installation needed!
+3. The application runs from the system tray
 
 ### Python (All Platforms)
 
 ```bash
 # Install via pip
-pip install singular-tweaks
+pip install elliotts-singular-controls
 
-# Run
-singular-tweaks
+# Run with GUI
+python -m elliotts_singular_controls.gui_launcher
 
-# Or run as module
-python -m singular_tweaks.core
+# Or run server only
+python -m elliotts_singular_controls
 ```
 
 ### From Source
 
 ```bash
-git clone https://github.com/BlueElliott/Singular-Tweaks.git
-cd Singular-Tweaks
+git clone https://github.com/BlueElliott/Elliotts-Singular-Controls.git
+cd Elliotts-Singular-Controls
 pip install -r requirements.txt
-python singular_tweaks/core.py
+python -m elliotts_singular_controls.gui_launcher
 ```
 
-## 🚀 Quick Start
+## Quick Start
 
 1. **Start the application**
-   - Windows: Run `SingularTweaks.exe`
-   - Python: Run `singular-tweaks`
+   - Windows: Run `ElliottsSingularControls.exe`
+   - Python: Run `python -m elliotts_singular_controls.gui_launcher`
 
 2. **Open the web interface**
+   - Click "Open Web GUI" in the desktop app, or
    - Navigate to `http://localhost:3113`
 
 3. **Configure Singular**
+   - Go to Settings page
    - Enter your Singular Control App Token
-   - Click "Save Token & Refresh Commands"
+   - Click "Save"
 
 4. **Control your compositions**
-   - Visit the "Commands" page to see all available controls
+   - Visit the Commands page to see all available controls
    - Use the provided URLs in your automation system
 
-## 📖 Usage Examples
+## Web Interface Pages
 
-### Trigger a Composition In/Out
+| Page | URL | Description |
+|------|-----|-------------|
+| Home | `http://localhost:3113/` | Overview with quick actions and token status |
+| Modules | `http://localhost:3113/modules` | TfL line status controls with manual input |
+| TfL Control | `http://localhost:3113/tfl/control` | Standalone TfL page for external operators |
+| Commands | `http://localhost:3113/commands` | All available Singular control commands |
+| Settings | `http://localhost:3113/settings` | Configure tokens, ports, and preferences |
 
-```bash
-# Bring composition IN
-GET http://localhost:3113/lower-third/in
+## TfL Integration
 
-# Take composition OUT
-GET http://localhost:3113/lower-third/out
-```
+### How It Works
 
-### Update Field Values
+1. **Automatic Fetch** - Click "Fetch Live TfL Status" to get real-time data from TfL API
+2. **Manual Input** - Override any line's status with custom text
+3. **Visual Feedback** - Input fields turn red when status isn't "Good Service"
+4. **Data Stream** - Send status data to Singular.live Data Stream for overlay display
 
-```bash
-# Set a text field
-GET http://localhost:3113/lower-third/set?field=Name&value=John%20Smith
+### Supported Lines
 
-# Set a number field
-GET http://localhost:3113/scoreboard/set?field=Score&value=42
-```
+**Underground:** Bakerloo, Central, Circle, District, Hammersmith & City, Jubilee, Metropolitan, Northern, Piccadilly, Victoria, Waterloo & City
 
-### Use with Stream Deck / Companion
+**Overground & Other:** Liberty, Lioness, Mildmay, Suffragette, Weaver, Windrush, DLR, Elizabeth line, Tram
 
-Simply use the "System: Open URL" action with any of the control URLs shown in the Commands page.
-
-### Use with OBS Browser Source
-
-Create a browser source that opens the control URL when you need to trigger a graphic.
-
-## ⚙️ Configuration
-
-### Singular Control App
-1. Log in to [Singular.live](https://app.singular.live)
-2. Go to your Control App
-3. Copy the Control App Token
-4. Paste it into Singular Tweaks
-
-### TfL Integration (Optional)
-1. Register for a [TfL API account](https://api.tfl.gov.uk/)
-2. Get your App ID and App Key
-3. Enter them in the Integrations page
-
-### Data Stream (Optional)
-1. Get your Singular Data Stream URL
-2. Enter it in the Integrations page
-3. Use `/update` endpoint to send data
-
-## 🔧 API Reference
+## API Reference
 
 ### Core Endpoints
 
-- `GET /` - Web interface home
-- `GET /commands` - List all available commands
-- `GET /settings` - Application settings
-- `GET /health` - Health check
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | GET | Web interface home |
+| `/modules` | GET | TfL modules page |
+| `/commands` | GET | List all available commands |
+| `/settings` | GET | Application settings |
+| `/health` | GET | Health check (for monitoring) |
 
-### Control Endpoints
-
-- `GET /{key}/in` - Animate composition IN
-- `GET /{key}/out` - Animate composition OUT
-- `GET /{key}/set?field=X&value=Y` - Set field value
-- `GET /{key}/timecontrol?field=X&run=true` - Control timers
-
-### Integration Endpoints
-
-- `GET /status` - Get TfL line statuses
-- `POST /update` - Send TfL data to Data Stream
-- `POST /test` - Send test data to Data Stream
-
-## 🛠️ Development
-
-### Setup Development Environment
+### Singular Control Endpoints
 
 ```bash
-git clone https://github.com/BlueElliott/Singular-Tweaks.git
-cd Singular-Tweaks
-python -m venv .venv
-.venv\Scripts\activate  # Windows
-source .venv/bin/activate  # Mac/Linux
-pip install -r requirements.txt
-pip install -r requirements-dev.txt
+# Animate composition IN
+GET http://localhost:3113/{composition-key}/in
+
+# Animate composition OUT
+GET http://localhost:3113/{composition-key}/out
+
+# Set a field value
+GET http://localhost:3113/{composition-key}/set?field=Name&value=John%20Smith
 ```
 
-### Run Tests
+### TfL Endpoints
 
 ```bash
-pytest
-pytest --cov=singular_tweaks  # With coverage
+# Get current TfL statuses
+GET http://localhost:3113/status
+
+# Send data to Data Stream
+POST http://localhost:3113/update
+
+# Manual status update
+POST http://localhost:3113/manual
 ```
 
-### Code Quality
+## Desktop Application
 
-```bash
-black singular_tweaks/
-ruff check singular_tweaks/
-bandit -r singular_tweaks/
-```
+The desktop GUI provides:
 
-### Build Executable
+- **Server Status** - Visual pulse indicator shows server health
+- **Runtime Display** - See how long the server has been running
+- **Port Configuration** - Change the server port (default: 3113)
+- **Console View** - Toggle server logs for debugging
+- **System Tray** - Minimize to tray for background operation
 
-```bash
-pyinstaller SingularTweaks.spec
-```
+### Keyboard Shortcuts
 
-## 📝 Configuration File
+- Click "Open Web GUI" to launch browser
+- Click "Open Console" to view server logs
+- Click "Restart Server" to restart without closing the app
+- Click "Hide to Tray" to minimize to system tray
 
-Settings are saved to `singular_tweaks_config.json` in the application directory:
+## Configuration
+
+Settings are saved to `elliotts_singular_controls_config.json`:
 
 ```json
 {
-  "singular_token": "your-token",
+  "singular_tokens": ["token1", "token2"],
   "singular_stream_url": "https://...",
-  "tfl_app_id": "your-app-id",
-  "tfl_app_key": "your-app-key",
-  "enable_tfl": true,
   "enable_datastream": true,
-  "theme": "dark",
   "port": 3113
 }
 ```
 
-## 🐛 Troubleshooting
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `SINGULAR_CONTROLS_PORT` | Server port | 3113 |
+
+## Troubleshooting
 
 **Port already in use?**
-- Change the port in Settings page
-- Or set environment variable: `SINGULAR_TWEAKS_PORT=3114`
+- Change the port in Settings, or
+- Click "Change Port" in the desktop app
 
 **Can't connect to Singular?**
 - Verify your Control App Token is correct
 - Check your internet connection
 - Try refreshing the command list
 
-**Fonts not displaying?**
-- Make sure the `static/` folder is in the same directory as the executable
+**TfL data not updating?**
+- Check your internet connection
+- Manual input will override automatic fetch
 
-## 📄 License
+**Connection Lost overlay appears?**
+- The server may have crashed - check the console
+- Click "Restart Server" in the desktop app
 
-MIT License - see [LICENSE](LICENSE) file for details
+## Development
 
-## 🤝 Contributing
+### Setup Development Environment
+
+```bash
+git clone https://github.com/BlueElliott/Elliotts-Singular-Controls.git
+cd Elliotts-Singular-Controls
+python -m venv .venv
+.venv\Scripts\activate  # Windows
+pip install -r requirements.txt
+```
+
+### Project Structure
+
+```
+Elliotts-Singular-Controls/
+├── elliotts_singular_controls/
+│   ├── __init__.py          # Version and exports
+│   ├── __main__.py           # Entry point
+│   ├── core.py               # FastAPI app, all HTML/CSS/JS
+│   └── gui_launcher.py       # Desktop GUI with system tray
+├── static/                   # Icons and fonts
+├── .github/workflows/        # CI/CD
+├── ElliottsSingularControls.spec  # PyInstaller config
+└── requirements.txt
+```
+
+### Build Executable
+
+```bash
+pyinstaller ElliottsSingularControls.spec
+# Output: dist/ElliottsSingularControls-1.1.0.exe
+```
+
+## Version History
+
+### v1.1.0 (Current)
+- Improved desktop GUI with smooth animated pulse indicator
+- Fixed TfL manual input background color on modules page
+- Enhanced UI consistency across all pages
+- Removed visual artifacts from rounded rectangles
+- Anti-aliased graphics using PIL rendering
+
+### v1.0.x
+- Initial release with core functionality
+- Web interface for Singular.live control
+- TfL integration with Data Stream support
+- Multi-token management
+
+## License
+
+MIT License - see [LICENSE](LICENSE) file for details.
+
+## Contributing
 
 Contributions welcome! Please feel free to submit a Pull Request.
 
@@ -220,18 +249,11 @@ Contributions welcome! Please feel free to submit a Pull Request.
 4. Push to the branch (`git push origin feature/AmazingFeature`)
 5. Open a Pull Request
 
-## 🙏 Acknowledgments
+## Support
 
-- [Singular.live](https://singular.live) - Amazing broadcast graphics platform
-- [TfL](https://tfl.gov.uk) - Transport for London API
-- [FastAPI](https://fastapi.tiangolo.com/) - Modern web framework
-- [PyInstaller](https://pyinstaller.org/) - Executable packaging
-
-## 📧 Support
-
-- 🐛 **Issues**: [GitHub Issues](https://github.com/BlueElliott/Singular-Tweaks/issues)
-- 💬 **Discussions**: [GitHub Discussions](https://github.com/BlueElliott/Singular-Tweaks/discussions)
+- **Issues**: [GitHub Issues](https://github.com/BlueElliott/Elliotts-Singular-Controls/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/BlueElliott/Elliotts-Singular-Controls/discussions)
 
 ---
 
-**Made with ❤️ by BlueElliott**
+**Made with care by BlueElliott**

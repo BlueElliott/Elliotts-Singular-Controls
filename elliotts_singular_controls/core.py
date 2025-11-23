@@ -6,7 +6,7 @@ import json
 import logging
 import traceback
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import quote
 from html import escape as html_escape
 from datetime import datetime
@@ -185,7 +185,8 @@ if not logger.handlers:
 
 
 class AppConfig(BaseModel):
-    singular_token: Optional[str] = None
+    singular_token: Optional[str] = None  # Legacy single token (for migration)
+    singular_tokens: Dict[str, str] = {}  # name → token mapping for multiple apps
     singular_stream_url: Optional[str] = None
     tfl_app_id: Optional[str] = None
     tfl_app_key: Optional[str] = None
@@ -198,6 +199,7 @@ class AppConfig(BaseModel):
 def load_config() -> AppConfig:
     base: Dict[str, Any] = {
         "singular_token": os.getenv("SINGULAR_TOKEN") or None,
+        "singular_tokens": {},
         "singular_stream_url": os.getenv("SINGULAR_STREAM_URL") or None,
         "tfl_app_id": os.getenv("TFL_APP_ID") or None,
         "tfl_app_key": os.getenv("TFL_APP_KEY") or None,
@@ -213,7 +215,12 @@ def load_config() -> AppConfig:
             base.update(file_data)
         except Exception as e:
             logger.warning("Failed to load config file %s: %s", CONFIG_PATH, e)
-    return AppConfig(**base)
+    cfg = AppConfig(**base)
+    # Migrate legacy singular_token to singular_tokens
+    if cfg.singular_token and not cfg.singular_tokens:
+        cfg.singular_tokens = {"Default": cfg.singular_token}
+        cfg.singular_token = None  # Clear legacy field
+    return cfg
 
 
 def save_config(cfg: AppConfig) -> None:
@@ -313,10 +320,11 @@ def send_to_datastream(payload: Dict[str, Any]):
         }
 
 
-def ctrl_patch(items: list):
-    if not CONFIG.singular_token:
-        raise HTTPException(400, "No Singular control app token configured")
-    ctrl_control = f"{SINGULAR_API_BASE}/controlapps/{CONFIG.singular_token}/control"
+def ctrl_patch(items: list, token: str):
+    """Send control PATCH to Singular with a specific token."""
+    if not token:
+        raise HTTPException(400, "No Singular control app token provided")
+    ctrl_control = f"{SINGULAR_API_BASE}/controlapps/{token}/control"
     try:
         resp = requests.patch(
             ctrl_control,
@@ -350,13 +358,13 @@ def _base_url(request: Request) -> str:
 
 # ================== 3. REGISTRY (Control App model) ==================
 
-REGISTRY: Dict[str, Dict[str, Any]] = {}
-ID_TO_KEY: Dict[str, str] = {}
+# REGISTRY structure: {app_name: {key: {id, name, fields, app_name, token}}}
+REGISTRY: Dict[str, Dict[str, Dict[str, Any]]] = {}
+ID_TO_KEY: Dict[str, Tuple[str, str]] = {}  # id → (app_name, key)
 
-def singular_model_fetch() -> Any:
-    if not CONFIG.singular_token:
-        raise RuntimeError("No Singular control app token configured")
-    ctrl_model = f"{SINGULAR_API_BASE}/controlapps/{CONFIG.singular_token}/model"
+def singular_model_fetch(token: str) -> Any:
+    """Fetch model for a specific token."""
+    ctrl_model = f"{SINGULAR_API_BASE}/controlapps/{token}/model"
     try:
         r = requests.get(ctrl_model, timeout=10)
         r.raise_for_status()
@@ -380,10 +388,23 @@ def _walk_nodes(node):
     return items
 
 
-def build_registry():
-    REGISTRY.clear()
-    ID_TO_KEY.clear()
-    data = singular_model_fetch()
+def build_registry_for_app(app_name: str, token: str) -> int:
+    """Build registry for a single app. Returns number of subcompositions found."""
+    if app_name not in REGISTRY:
+        REGISTRY[app_name] = {}
+    else:
+        # Clear existing entries for this app from ID_TO_KEY
+        for sid, (a, k) in list(ID_TO_KEY.items()):
+            if a == app_name:
+                del ID_TO_KEY[sid]
+        REGISTRY[app_name].clear()
+
+    try:
+        data = singular_model_fetch(token)
+    except Exception as e:
+        logger.warning("Failed to fetch model for app %s: %s", app_name, e)
+        return 0
+
     flat = _walk_nodes(data)
     for n in flat:
         sid = n.get("id")
@@ -394,21 +415,48 @@ def build_registry():
         key = slugify(name)
         orig_key = key
         i = 2
-        while key in REGISTRY and REGISTRY[key]["id"] != sid:
+        while key in REGISTRY[app_name] and REGISTRY[app_name][key]["id"] != sid:
             key = f"{orig_key}-{i}"
             i += 1
-        REGISTRY[key] = {
+        REGISTRY[app_name][key] = {
             "id": sid,
             "name": name,
             "fields": {(f.get("id") or ""): f for f in (model or [])},
+            "app_name": app_name,
+            "token": token,
         }
-        ID_TO_KEY[sid] = key
-    log_event("Registry", f"Built with {len(REGISTRY)} subcompositions")
+        ID_TO_KEY[sid] = (app_name, key)
+    return len(REGISTRY[app_name])
 
 
-def kfind(key_or_id: str) -> str:
-    if key_or_id in REGISTRY:
-        return key_or_id
+def build_registry():
+    """Build registry for all configured apps."""
+    REGISTRY.clear()
+    ID_TO_KEY.clear()
+    total = 0
+    for app_name, token in CONFIG.singular_tokens.items():
+        count = build_registry_for_app(app_name, token)
+        total += count
+        log_event("Registry", f"App '{app_name}': {count} subcompositions")
+    log_event("Registry", f"Total: {total} subcompositions from {len(CONFIG.singular_tokens)} app(s)")
+
+
+def kfind(key_or_id: str, app_name: Optional[str] = None) -> Tuple[str, str]:
+    """Find a subcomposition by key or id. Returns (app_name, key)."""
+    # If app_name specified, look only in that app
+    if app_name:
+        if app_name in REGISTRY and key_or_id in REGISTRY[app_name]:
+            return (app_name, key_or_id)
+        if key_or_id in ID_TO_KEY:
+            found_app, found_key = ID_TO_KEY[key_or_id]
+            if found_app == app_name:
+                return (found_app, found_key)
+        raise HTTPException(404, f"Subcomposition not found: {key_or_id} in app {app_name}")
+
+    # Search across all apps
+    for a_name, subs in REGISTRY.items():
+        if key_or_id in subs:
+            return (a_name, key_or_id)
     if key_or_id in ID_TO_KEY:
         return ID_TO_KEY[key_or_id]
     raise HTTPException(404, f"Subcomposition not found: {key_or_id}")
@@ -433,7 +481,7 @@ def coerce_value(field_meta: Dict[str, Any], value_str: str, as_string: bool = F
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
-        if CONFIG.singular_token:
+        if CONFIG.singular_tokens:
             build_registry()
     except Exception as e:
         logger.warning("[WARN] Registry build failed: %s", e)
@@ -466,12 +514,12 @@ class SingularItem(BaseModel):
 
 # ================== 5. HTML helpers ==================
 
-def _nav_html() -> str:
+def _nav_html(active: str = "") -> str:
+    pages = [("Home", "/"), ("Commands", "/commands"), ("Modules", "/modules"), ("Settings", "/settings")]
     parts = ['<div class="nav">']
-    parts.append('<a href="/">Home</a>')
-    parts.append('<a href="/commands">Commands</a>')
-    parts.append('<a href="/modules">Modules</a>')
-    parts.append('<a href="/settings">Settings</a>')
+    for name, href in pages:
+        cls = ' class="active"' if active.lower() == name.lower() else ''
+        parts.append(f'<a href="{href}"{cls}>{name}</a>')
     parts.append('</div>')
     return "".join(parts)
 
@@ -517,26 +565,44 @@ def _base_style() -> str:
     lines.append(f"  input:focus, select:focus {{ outline: none; border-color: {accent}; box-shadow: 0 0 0 3px {accent}33; }}")
     lines.append(
         f"  button {{ display: inline-flex; align-items: center; justify-content: center; gap: 8px; "
-        f"margin-top: 12px; margin-right: 8px; padding: 10px 20px; cursor: pointer; "
+        f"margin-top: 12px; margin-right: 8px; padding: 0 20px; height: 40px; cursor: pointer; "
         f"background: {accent}; color: #fff; border: none; border-radius: 8px; "
         f"font-size: 14px; font-weight: 500; transition: all 0.2s; }}"
     )
     lines.append(f"  button:hover {{ background: {accent_hover}; transform: translateY(-1px); box-shadow: 0 4px 12px {accent}40; }}")
     lines.append(f"  button:active {{ transform: translateY(0); }}")
+    # Button variants
+    lines.append(f"  button.secondary {{ background: {border}; color: {fg}; }}")
+    lines.append(f"  button.secondary:hover {{ background: #4a4a4a; box-shadow: none; transform: none; }}")
+    lines.append(f"  button.danger {{ background: #ef4444; }}")
+    lines.append(f"  button.danger:hover {{ background: #dc2626; }}")
+    lines.append(f"  button.warning {{ background: #f59e0b; color: #000; }}")
+    lines.append(f"  button.warning:hover {{ background: #d97706; }}")
+    lines.append(f"  button.success {{ background: #22c55e; }}")
+    lines.append(f"  button.success:hover {{ background: #16a34a; }}")
+    # Button row utility
+    lines.append(f"  .btn-row {{ display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 16px; }}")
+    lines.append(f"  .btn-row button, .btn-row .status {{ margin: 0 !important; margin-top: 0 !important; margin-right: 0 !important; }}")
+    # Status indicator (same height as buttons for alignment)
+    lines.append(f"  .status {{ display: inline-flex; align-items: center; justify-content: center; padding: 0 20px; height: 40px; border-radius: 8px; font-size: 14px; font-weight: 500; white-space: nowrap; }}")
+    lines.append(f"  .status.idle {{ background: {border}; color: {text_muted}; }}")
+    lines.append(f"  .status.success {{ background: #22c55e; color: #fff; }}")
+    lines.append(f"  .status.error {{ background: #ef4444; color: #fff; }}")
     lines.append(
-        f"  pre {{ background: #000; color: #4ade80; padding: 16px; white-space: pre-wrap; "
+        f"  pre {{ background: #000; color: #00bcd4; padding: 16px; white-space: pre-wrap; "
         f"max-height: 250px; overflow: auto; border-radius: 8px; font-size: 13px; "
         f"font-family: 'SF Mono', Monaco, 'Cascadia Code', Consolas, monospace; border: 1px solid {border}; }}"
     )
     lines.append(
         f"  .nav {{ position: fixed; top: 16px; left: 16px; display: flex; gap: 4px; z-index: 1000; "
-        f"background: {card_bg}; padding: 6px; border-radius: 10px; border: 1px solid {border}; box-shadow: 0 2px 8px rgba(0,0,0,0.3); }}"
+        f"background: {card_bg}; padding: 6px; border-radius: 10px; border: 1px solid {accent}40; box-shadow: 0 2px 12px rgba(0,188,212,0.15); }}"
     )
     lines.append(
         f"  .nav a {{ color: {text_muted}; text-decoration: none; padding: 8px 14px; border-radius: 6px; "
         f"font-size: 13px; font-weight: 500; transition: all 0.2s; }}"
     )
-    lines.append(f"  .nav a:hover {{ background: {input_bg}; color: {accent}; }}")
+    lines.append(f"  .nav a:hover {{ background: {accent}20; color: {accent}; }}")
+    lines.append(f"  .nav a.active {{ background: {accent}; color: #fff; }}")
     lines.append(f"  table {{ border-collapse: collapse; width: 100%; margin-top: 12px; border-radius: 8px; overflow: hidden; }}")
     lines.append(f"  th, td {{ border: 1px solid {border}; padding: 10px 14px; font-size: 13px; text-align: left; }}")
     lines.append(f"  th {{ background: {accent}; color: #fff; font-weight: 600; }}")
@@ -567,10 +633,11 @@ def _base_style() -> str:
 
 @app.get("/config")
 def get_config():
+    total_subs = sum(len(subs) for subs in REGISTRY.values())
     return {
         "singular": {
-            "token_set": bool(CONFIG.singular_token),
-            "token": CONFIG.singular_token,
+            "tokens": CONFIG.singular_tokens,
+            "token_count": len(CONFIG.singular_tokens),
             "stream_url": CONFIG.singular_stream_url,
         },
         "tfl": {
@@ -584,18 +651,69 @@ def get_config():
             "tfl_auto_refresh": CONFIG.tfl_auto_refresh,
             "theme": CONFIG.theme,
         },
+        "registry": {
+            "apps": len(REGISTRY),
+            "total_subs": total_subs,
+        }
     }
+
+
+class AddTokenIn(BaseModel):
+    name: str
+    token: str
+
+
+@app.post("/config/singular/add")
+def add_singular_token(cfg: AddTokenIn):
+    """Add a new Singular control app token."""
+    name = cfg.name.strip()
+    token = cfg.token.strip()
+    if not name:
+        raise HTTPException(400, "App name is required")
+    if not token:
+        raise HTTPException(400, "Token is required")
+    if name in CONFIG.singular_tokens:
+        raise HTTPException(400, f"App '{name}' already exists")
+    CONFIG.singular_tokens[name] = token
+    save_config(CONFIG)
+    try:
+        count = build_registry_for_app(name, token)
+        log_event("Token Added", f"App '{name}': {count} subcompositions")
+    except Exception as e:
+        raise HTTPException(400, f"Token saved, but registry build failed: {e}")
+    total_subs = sum(len(subs) for subs in REGISTRY.values())
+    return {"ok": True, "message": f"Added app '{name}'", "subs": total_subs}
+
+
+@app.post("/config/singular/remove")
+def remove_singular_token(name: str = Query(..., description="App name to remove")):
+    """Remove a Singular control app token."""
+    if name not in CONFIG.singular_tokens:
+        raise HTTPException(404, f"App '{name}' not found")
+    del CONFIG.singular_tokens[name]
+    if name in REGISTRY:
+        # Remove from ID_TO_KEY
+        for sid, (a, k) in list(ID_TO_KEY.items()):
+            if a == name:
+                del ID_TO_KEY[sid]
+        del REGISTRY[name]
+    save_config(CONFIG)
+    log_event("Token Removed", f"App '{name}'")
+    total_subs = sum(len(subs) for subs in REGISTRY.values())
+    return {"ok": True, "message": f"Removed app '{name}'", "subs": total_subs}
 
 
 @app.post("/config/singular")
 def set_singular_config(cfg: SingularConfigIn):
-    CONFIG.singular_token = cfg.token
+    """Legacy endpoint - adds/updates 'Default' app token."""
+    CONFIG.singular_tokens["Default"] = cfg.token
     save_config(CONFIG)
     try:
-        build_registry()
+        build_registry_for_app("Default", cfg.token)
     except Exception as e:
         raise HTTPException(400, f"Token saved, but registry build failed: {e}")
-    return {"ok": True, "message": "Singular token updated", "subs": len(REGISTRY)}
+    total_subs = sum(len(subs) for subs in REGISTRY.values())
+    return {"ok": True, "message": "Singular token updated", "subs": total_subs}
 
 
 @app.post("/config/tfl")
@@ -755,27 +873,32 @@ def get_events():
 
 
 @app.get("/singular/ping")
-def singular_ping():
-    try:
-        data = singular_model_fetch()
-        if isinstance(data, dict):
-            top_keys = list(data.keys())[:5]
-        elif isinstance(data, list):
-            if data and isinstance(data[0], dict):
-                top_keys = [f"[0].{k}" for k in data[0].keys()][:5]
-            else:
-                top_keys = [f"list(len={len(data)})"]
-        else:
-            top_keys = [type(data).__name__]
-        return {
-            "ok": True,
-            "message": "Connected to Singular",
-            "model_type": type(data).__name__,
-            "top_level_keys": top_keys,
-            "subs": len(REGISTRY),
-        }
-    except Exception as e:
-        raise HTTPException(500, f"Singular ping failed: {e}")
+def singular_ping(app_name: Optional[str] = Query(None, description="App name to ping (optional, pings all if not specified)")):
+    """Ping Singular to verify connectivity. Can ping specific app or all apps."""
+    if not CONFIG.singular_tokens:
+        raise HTTPException(400, "No Singular tokens configured")
+
+    results = {}
+    total_subs = 0
+
+    apps_to_ping = {app_name: CONFIG.singular_tokens[app_name]} if app_name and app_name in CONFIG.singular_tokens else CONFIG.singular_tokens
+
+    for name, token in apps_to_ping.items():
+        try:
+            data = singular_model_fetch(token)
+            subs = len(REGISTRY.get(name, {}))
+            total_subs += subs
+            results[name] = {"ok": True, "subs": subs}
+        except Exception as e:
+            results[name] = {"ok": False, "error": str(e)}
+
+    all_ok = all(r["ok"] for r in results.values())
+    return {
+        "ok": all_ok,
+        "message": "Connected to Singular" if all_ok else "Some connections failed",
+        "apps": results,
+        "total_subs": total_subs,
+    }
 
 
 # ================== 7. TfL / DataStream endpoints ==================
@@ -850,23 +973,37 @@ def send_manual(payload: Dict[str, str]):
 # ================== 8. Control app endpoints ==================
 
 @app.post("/singular/control")
-def singular_control(items: List[SingularItem]):
-    r = ctrl_patch([i.dict(exclude_none=True) for i in items])
+def singular_control(items: List[SingularItem], app_name: Optional[str] = Query(None, description="App name to send to")):
+    # If app_name not specified, use first available token
+    if app_name and app_name in CONFIG.singular_tokens:
+        token = CONFIG.singular_tokens[app_name]
+    elif CONFIG.singular_tokens:
+        token = list(CONFIG.singular_tokens.values())[0]
+    else:
+        raise HTTPException(400, "No Singular control app tokens configured")
+    r = ctrl_patch([i.dict(exclude_none=True) for i in items], token)
     return {"status": r.status_code, "response": r.text}
 
 
 @app.get("/singular/list")
 def singular_list():
-    return {
-        k: {"id": v["id"], "name": v["name"], "fields": list(v["fields"].keys())}
-        for k, v in REGISTRY.items()
-    }
+    result = {}
+    for app_name, subs in REGISTRY.items():
+        for k, v in subs.items():
+            result[f"{app_name}/{k}"] = {
+                "id": v["id"],
+                "name": v["name"],
+                "app": app_name,
+                "fields": list(v["fields"].keys())
+            }
+    return result
 
 
 @app.post("/singular/refresh")
 def singular_refresh():
     build_registry()
-    return {"ok": True, "count": len(REGISTRY)}
+    total = sum(len(subs) for subs in REGISTRY.values())
+    return {"ok": True, "count": total, "apps": len(REGISTRY)}
 
 
 def _field_examples(base: str, key: str, field_id: str, field_meta: dict):
@@ -889,86 +1026,98 @@ def _field_examples(base: str, key: str, field_id: str, field_meta: dict):
 def singular_commands(request: Request):
     base = _base_url(request)
     catalog: Dict[str, Any] = {}
-    for key, meta in REGISTRY.items():
-        sid = meta["id"]
-        entry: Dict[str, Any] = {
-            "id": sid,
-            "name": meta["name"],
-            "in_url": f"{base}/{key}/in",
-            "out_url": f"{base}/{key}/out",
-            "fields": {},
-        }
-        for fid, fmeta in meta["fields"].items():
-            if not fid:
-                continue
-            entry["fields"][fid] = _field_examples(base, key, fid, fmeta)
-        catalog[key] = entry
+    for app_name, subs in REGISTRY.items():
+        for key, meta in subs.items():
+            # Use app_name/key format for unique identification
+            full_key = f"{app_name}/{key}"
+            sid = meta["id"]
+            entry: Dict[str, Any] = {
+                "id": sid,
+                "name": meta["name"],
+                "app_name": app_name,
+                "in_url": f"{base}/{app_name}/{key}/in",
+                "out_url": f"{base}/{app_name}/{key}/out",
+                "fields": {},
+            }
+            for fid, fmeta in meta["fields"].items():
+                if not fid:
+                    continue
+                entry["fields"][fid] = _field_examples(base, f"{app_name}/{key}", fid, fmeta)
+            catalog[full_key] = entry
     return {
         "note": "Most control endpoints support GET for testing, but POST is recommended in automation.",
         "catalog": catalog,
     }
 
 
-@app.get("/{key}/help")
-def singular_commands_for_one(key: str, request: Request):
-    k = kfind(key)
+@app.get("/{app_name}/{key}/help")
+def singular_commands_for_one(app_name: str, key: str, request: Request):
+    found_app, k = kfind(key, app_name)
     base = _base_url(request)
-    meta = REGISTRY[k]
+    meta = REGISTRY[found_app][k]
     sid = meta["id"]
     entry: Dict[str, Any] = {
         "id": sid,
         "name": meta["name"],
-        "in_url": f"{base}/{k}/in",
-        "out_url": f"{base}/{k}/out",
+        "app_name": found_app,
+        "in_url": f"{base}/{found_app}/{k}/in",
+        "out_url": f"{base}/{found_app}/{k}/out",
         "fields": {},
     }
     for fid, fmeta in meta["fields"].items():
         if not fid:
             continue
-        entry["fields"][fid] = _field_examples(base, k, fid, fmeta)
+        entry["fields"][fid] = _field_examples(base, f"{found_app}/{k}", fid, fmeta)
     return {"commands": entry}
 
 
-@app.api_route("/{key}/in", methods=["GET", "POST"])
-def sub_in(key: str):
-    k = kfind(key)
-    sid = REGISTRY[k]["id"]
-    r = ctrl_patch([{"subCompositionId": sid, "state": "In"}])
-    log_event("IN", f"{k} ({sid})")
-    return {"status": r.status_code, "id": sid, "response": r.text}
+@app.api_route("/{app_name}/{key}/in", methods=["GET", "POST"])
+def sub_in(app_name: str, key: str):
+    found_app, k = kfind(key, app_name)
+    meta = REGISTRY[found_app][k]
+    sid = meta["id"]
+    token = meta["token"]
+    r = ctrl_patch([{"subCompositionId": sid, "state": "In"}], token)
+    log_event("IN", f"{found_app}/{k} ({sid})")
+    return {"status": r.status_code, "id": sid, "app": found_app, "response": r.text}
 
 
-@app.api_route("/{key}/out", methods=["GET", "POST"])
-def sub_out(key: str):
-    k = kfind(key)
-    sid = REGISTRY[k]["id"]
-    r = ctrl_patch([{"subCompositionId": sid, "state": "Out"}])
-    log_event("OUT", f"{k} ({sid})")
-    return {"status": r.status_code, "id": sid, "response": r.text}
+@app.api_route("/{app_name}/{key}/out", methods=["GET", "POST"])
+def sub_out(app_name: str, key: str):
+    found_app, k = kfind(key, app_name)
+    meta = REGISTRY[found_app][k]
+    sid = meta["id"]
+    token = meta["token"]
+    r = ctrl_patch([{"subCompositionId": sid, "state": "Out"}], token)
+    log_event("OUT", f"{found_app}/{k} ({sid})")
+    return {"status": r.status_code, "id": sid, "app": found_app, "response": r.text}
 
 
-@app.api_route("/{key}/set", methods=["GET", "POST"])
+@app.api_route("/{app_name}/{key}/set", methods=["GET", "POST"])
 def sub_set(
+    app_name: str,
     key: str,
     field: str = Query(..., description="Field id as shown in /singular/list"),
     value: str = Query(..., description="Value to set"),
     asString: int = Query(0, description="Send value strictly as string if 1"),
 ):
-    k = kfind(key)
-    meta = REGISTRY[k]
+    found_app, k = kfind(key, app_name)
+    meta = REGISTRY[found_app][k]
     sid = meta["id"]
+    token = meta["token"]
     fields = meta["fields"]
     if field not in fields:
-        raise HTTPException(404, f"Field not found on {k}: {field}")
+        raise HTTPException(404, f"Field not found on {found_app}/{k}: {field}")
     v = coerce_value(fields[field], value, as_string=bool(asString))
     patch = [{"subCompositionId": sid, "payload": {field: v}}]
-    r = ctrl_patch(patch)
-    log_event("SET", f"{k} ({sid}) field={field} value={value}")
-    return {"status": r.status_code, "id": sid, "sent": patch, "response": r.text}
+    r = ctrl_patch(patch, token)
+    log_event("SET", f"{found_app}/{k} ({sid}) field={field} value={value}")
+    return {"status": r.status_code, "id": sid, "app": found_app, "sent": patch, "response": r.text}
 
 
-@app.api_route("/{key}/timecontrol", methods=["GET", "POST"])
+@app.api_route("/{app_name}/{key}/timecontrol", methods=["GET", "POST"])
 def sub_timecontrol(
+    app_name: str,
     key: str,
     field: str = Query(..., description="timecontrol field id"),
     run: bool = Query(True, description="True=start, False=stop"),
@@ -976,12 +1125,13 @@ def sub_timecontrol(
     utc: Optional[float] = Query(None, description="override UTC ms; default now()"),
     seconds: Optional[int] = Query(None, description="optional duration for countdowns"),
 ):
-    k = kfind(key)
-    meta = REGISTRY[k]
+    found_app, k = kfind(key, app_name)
+    meta = REGISTRY[found_app][k]
     sid = meta["id"]
+    token = meta["token"]
     fields = meta["fields"]
     if field not in fields:
-        raise HTTPException(404, f"Field not found on {k}: {field}")
+        raise HTTPException(404, f"Field not found on {found_app}/{k}: {field}")
     if (fields[field].get("type") or "").lower() != "timecontrol":
         raise HTTPException(400, f"Field '{field}' is not a timecontrol")
     payload: Dict[str, Any] = {}
@@ -992,117 +1142,199 @@ def sub_timecontrol(
         "isRunning": bool(run),
         "value": int(value),
     }
-    r = ctrl_patch([{"subCompositionId": sid, "payload": payload}])
-    log_event("TIMECONTROL", f"{k} ({sid}) field={field} run={run} seconds={seconds}")
-    return {"status": r.status_code, "id": sid, "sent": payload, "response": r.text}
+    r = ctrl_patch([{"subCompositionId": sid, "payload": payload}], token)
+    log_event("TIMECONTROL", f"{found_app}/{k} ({sid}) field={field} run={run} seconds={seconds}")
+    return {"status": r.status_code, "id": sid, "app": found_app, "sent": payload, "response": r.text}
 
 
 # ================== 9. HTML Pages ==================
 
 @app.get("/", response_class=HTMLResponse)
 def index():
+    """Home page - completely rewritten with simple, reliable JS using XMLHttpRequest."""
     parts: List[str] = []
+    parts.append("<!DOCTYPE html>")
     parts.append("<html><head>")
     parts.append("<title>Elliott's Singular Controls v" + _runtime_version() + "</title>")
     parts.append(_base_style())
+    parts.append("<style>")
+    parts.append("  .app-list { margin: 12px 0; }")
+    parts.append("  .app-item { display: flex; align-items: center; gap: 8px; padding: 12px; background: #1a1a1a; border: 1px solid #3d3d3d; border-radius: 8px; margin-bottom: 8px; }")
+    parts.append("  .app-item .app-name { font-weight: 600; font-size: 14px; min-width: 70px; }")
+    parts.append("  .app-item .app-token { flex: 1; font-family: 'SF Mono', Monaco, Consolas, monospace; font-size: 11px; color: #888; background: #252525; padding: 0 12px; height: 32px; line-height: 32px; border-radius: 6px; border: 1px solid #3d3d3d; overflow-x: auto; white-space: nowrap; }")
+    parts.append("  .app-item .app-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-shrink: 0; }")
+    parts.append("  .app-item .app-status { height: 32px; min-width: 75px; padding: 0 10px; border-radius: 6px; font-size: 12px; font-weight: 500; display: inline-flex; align-items: center; justify-content: center; }")
+    parts.append("  .app-item .app-status.ok { background: #22c55e; color: #fff; }")
+    parts.append("  .app-item .app-status.error { background: #ef4444; color: #fff; }")
+    parts.append("  .app-item .app-status.checking { background: #f59e0b; color: #000; }")
+    parts.append("  .app-item button { height: 32px; padding: 0 14px; font-size: 12px; margin: 0 !important; }")
+    parts.append("  .add-app-form { display: flex; gap: 8px; align-items: flex-end; margin-top: 16px; padding-top: 16px; border-top: 1px solid #3d3d3d; }")
+    parts.append("  .add-app-form label { margin: 0; font-size: 12px; }")
+    parts.append("  .add-app-form input { margin-top: 4px; height: 32px; }")
+    parts.append("  .add-app-form button { height: 32px; margin: 0 !important; }")
+    parts.append("</style>")
     parts.append("</head><body>")
-    parts.append(_nav_html())
+    parts.append(_nav_html("Home"))
     parts.append("<h1>Elliott's Singular Controls</h1>")
     parts.append("<p>Mainly used to send <strong>GET</strong> and simple HTTP commands to your Singular Control App.</p>")
-    # Show full token (not sensitive)
-    saved = "Not set"
-    if CONFIG.singular_token:
-        saved = CONFIG.singular_token
-    parts.append('<fieldset><legend>Singular Control App Token</legend>')
-    parts.append('<div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">')
-    parts.append('<span style="font-size:13px;color:#8b949e;">Current:</span>')
-    parts.append('<code id="saved-token" style="flex:1;max-width:none;">' + html_escape(saved) + "</code>")
-    parts.append('<span id="singular-status" class="status-badge warning">Unknown</span>')
-    parts.append('<button type="button" onclick="pingSingular()" style="margin:0;">Ping</button>')
-    parts.append("</div>")
-    parts.append('<form id="singular-form" style="display:flex;gap:8px;align-items:flex-end;">')
-    parts.append('<label style="flex:1;margin:0;">New Token <input name="token" autocomplete="off" placeholder="Paste your Control App Token here" /></label>')
-    parts.append('<button type="submit" style="margin:0;">Update Token</button>')
-    parts.append("</form></fieldset>")
+    # Multiple tokens management
+    parts.append('<fieldset><legend>Singular Control Apps</legend>')
+    parts.append('<p style="color: #8b949e; margin-bottom: 16px;">Manage multiple Singular control app tokens. Each app can have its own subcompositions.</p>')
+    parts.append('<div id="app-list" class="app-list"><p style="color: #888;">Loading...</p></div>')
+    parts.append('<div class="add-app-form">')
+    parts.append('<label>App Name <input type="text" id="new-app-name" placeholder="e.g. Main Show" style="width: 150px;" /></label>')
+    parts.append('<label style="flex: 1;">Token <input type="text" id="new-app-token" placeholder="Paste Control App Token" style="width: 100%;" /></label>')
+    parts.append('<button type="button" id="btn-add">Add App</button>')
+    parts.append('<button type="button" id="btn-ping-all" class="secondary">Ping All</button>')
+    parts.append('</div>')
+    parts.append('</fieldset>')
     parts.append('<fieldset><legend>Event Log</legend>')
     parts.append("<p>Shows recent HTTP commands and updates triggered by this tool.</p>")
-    parts.append('<button type="button" onclick="loadEvents()">Refresh Log</button>')
+    parts.append('<button type="button" id="btn-refresh-log">Refresh Log</button>')
     parts.append('<pre id="log">No events yet.</pre>')
     parts.append("</fieldset>")
-    # JS
+
+    # Completely rewritten JS - inline script at end of body for simplicity
     parts.append("<script>")
-    parts.append("async function postJSON(url, data) {")
-    parts.append("  const res = await fetch(url, {")
-    parts.append('    method: "POST",')
-    parts.append('    headers: { "Content-Type": "application/json" },')
-    parts.append("    body: JSON.stringify(data),")
-    parts.append("  });")
-    parts.append("  const text = await res.text();")
-    parts.append("  return text;")
-    parts.append("}")
-    parts.append("async function loadConfig() {")
-    parts.append("  try {")
-    parts.append('    const res = await fetch("/config");')
-    parts.append("    if (!res.ok) return;")
-    parts.append("    const cfg = await res.json();")
-    parts.append("    const tokenSet = cfg.singular.token_set;")
-    parts.append("    const token = cfg.singular.token;")
-    parts.append('    const saved = document.getElementById("saved-token");')
-    parts.append("    if (tokenSet && token) {")
-    parts.append('      saved.textContent = token;')
-    parts.append("    } else {")
-    parts.append('      saved.textContent = "Not set";')
-    parts.append("    }")
-    parts.append("  } catch (e) { console.error(e); }")
-    parts.append("}")
-    parts.append("async function pingSingular() {")
-    parts.append('  const statusEl = document.getElementById("singular-status");')
-    parts.append('  statusEl.textContent = "Checking...";')
-    parts.append('  statusEl.className = "status-badge warning";')
-    parts.append("  try {")
-    parts.append('    const res = await fetch("/singular/ping");')
-    parts.append("    const txt = await res.text();")
-    parts.append("    try {")
-    parts.append("      const data = JSON.parse(txt);")
-    parts.append("      if (data.ok) {")
-    parts.append('        statusEl.textContent = "Connected (" + (data.subs || 0) + " subs)";')
-    parts.append('        statusEl.className = "status-badge success";')
-    parts.append('      } else { statusEl.textContent = "Error"; statusEl.className = "status-badge error"; }')
-    parts.append('    } catch (e) { statusEl.textContent = txt; statusEl.className = "status-badge error"; }')
-    parts.append('  } catch (e) { statusEl.textContent = "Ping failed"; statusEl.className = "status-badge error"; }')
-    parts.append("}")
-    parts.append("async function refreshRegistry() {")
-    parts.append('  const statusEl = document.getElementById("singular-status");')
-    parts.append('  statusEl.textContent = "Refreshing...";')
-    parts.append('  statusEl.className = "status-badge warning";')
-    parts.append("  try {")
-    parts.append('    const res = await fetch("/singular/refresh", { method: "POST" });')
-    parts.append("    const data = await res.json();")
-    parts.append('    statusEl.textContent = "Registry: " + (data.count || 0) + " subs";')
-    parts.append('    statusEl.className = "status-badge success";')
-    parts.append('  } catch (e) { statusEl.textContent = "Refresh failed"; statusEl.className = "status-badge error"; }')
-    parts.append("}")
-    parts.append("async function loadEvents() {")
-    parts.append("  try {")
-    parts.append('    const res = await fetch("/events");')
-    parts.append("    const data = await res.json();")
-    parts.append('    document.getElementById("log").innerText = (data.events || []).join("\\n") || "No events yet.";')
-    parts.append("  } catch (e) {")
-    parts.append('    document.getElementById("log").innerText = "Failed to load events: " + e;')
+    # Global variables
+    parts.append("var CONFIG = null;")
+    parts.append("")
+    # XHR helper - simplest possible
+    parts.append("function xhr(method, url, data, callback) {")
+    parts.append("  var req = new XMLHttpRequest();")
+    parts.append("  req.open(method, url, true);")
+    parts.append("  req.onload = function() {")
+    parts.append("    var json = null;")
+    parts.append("    try { json = JSON.parse(req.responseText); } catch(e) {}")
+    parts.append("    callback(req.status, json);")
+    parts.append("  };")
+    parts.append("  req.onerror = function() { callback(0, null); };")
+    parts.append("  if (data) {")
+    parts.append("    req.setRequestHeader('Content-Type', 'application/json');")
+    parts.append("    req.send(JSON.stringify(data));")
+    parts.append("  } else {")
+    parts.append("    req.send();")
     parts.append("  }")
     parts.append("}")
-    parts.append('document.getElementById("singular-form").onsubmit = async (e) => {')
-    parts.append("  e.preventDefault();")
-    parts.append("  const f = e.target;")
-    parts.append("  const token = f.token.value;")
+    parts.append("")
+    # Render apps
+    parts.append("function renderApps() {")
+    parts.append("  var container = document.getElementById('app-list');")
+    parts.append("  if (!CONFIG || !CONFIG.singular || !CONFIG.singular.tokens) {")
+    parts.append("    container.innerHTML = '<p style=\"color: #888;\">No apps configured. Add one below.</p>';")
+    parts.append("    return;")
+    parts.append("  }")
+    parts.append("  var tokens = CONFIG.singular.tokens;")
+    parts.append("  var names = Object.keys(tokens);")
+    parts.append("  if (names.length === 0) {")
+    parts.append("    container.innerHTML = '<p style=\"color: #888;\">No apps configured. Add one below.</p>';")
+    parts.append("    return;")
+    parts.append("  }")
+    parts.append("  var html = '';")
+    parts.append("  for (var i = 0; i < names.length; i++) {")
+    parts.append("    var name = names[i];")
+    parts.append("    var token = tokens[name];")
+    parts.append("    var shortToken = token.length > 40 ? token.substring(0, 40) + '...' : token;")
+    parts.append("    html += '<div class=\"app-item\">';")
+    parts.append("    html += '<span class=\"app-name\">' + name + '</span>';")
+    parts.append("    html += '<span class=\"app-token\">' + shortToken + '</span>';")
+    parts.append("    html += '<div class=\"app-actions\">';")
+    parts.append("    html += '<span class=\"app-status checking\" id=\"status-' + name + '\">...</span>';")
+    parts.append("    html += '<button onclick=\"pingApp(\\'' + name + '\\')\">Ping</button>';")
+    parts.append("    html += '<button class=\"danger\" onclick=\"removeApp(\\'' + name + '\\')\">Remove</button>';")
+    parts.append("    html += '</div>';")
+    parts.append("    html += '</div>';")
+    parts.append("  }")
+    parts.append("  container.innerHTML = html;")
+    parts.append("}")
+    parts.append("")
+    # Load config
+    parts.append("function loadConfig(callback) {")
+    parts.append("  xhr('GET', '/config', null, function(status, data) {")
+    parts.append("    if (status === 200 && data) {")
+    parts.append("      CONFIG = data;")
+    parts.append("      renderApps();")
+    parts.append("    }")
+    parts.append("    if (callback) callback();")
+    parts.append("  });")
+    parts.append("}")
+    parts.append("")
+    # Ping single app
+    parts.append("function pingApp(name) {")
+    parts.append("  var el = document.getElementById('status-' + name);")
+    parts.append("  if (!el) return;")
+    parts.append("  el.textContent = '...';")
+    parts.append("  el.className = 'app-status checking';")
+    parts.append("  xhr('GET', '/singular/ping?app_name=' + encodeURIComponent(name), null, function(status, data) {")
+    parts.append("    if (status === 200 && data && data.ok && data.apps && data.apps[name] && data.apps[name].ok) {")
+    parts.append("      el.textContent = data.apps[name].subs + ' subs';")
+    parts.append("      el.className = 'app-status ok';")
+    parts.append("    } else {")
+    parts.append("      el.textContent = 'Error';")
+    parts.append("      el.className = 'app-status error';")
+    parts.append("    }")
+    parts.append("  });")
+    parts.append("}")
+    parts.append("")
+    # Ping all
+    parts.append("function pingAll() {")
+    parts.append("  if (!CONFIG || !CONFIG.singular || !CONFIG.singular.tokens) return;")
+    parts.append("  var names = Object.keys(CONFIG.singular.tokens);")
+    parts.append("  for (var i = 0; i < names.length; i++) {")
+    parts.append("    pingApp(names[i]);")
+    parts.append("  }")
+    parts.append("}")
+    parts.append("")
+    # Add app
+    parts.append("function addApp() {")
+    parts.append("  var nameEl = document.getElementById('new-app-name');")
+    parts.append("  var tokenEl = document.getElementById('new-app-token');")
+    parts.append("  var name = nameEl.value.trim();")
+    parts.append("  var token = tokenEl.value.trim();")
+    parts.append("  if (!name) { alert('Please enter an app name.'); return; }")
     parts.append("  if (!token) { alert('Please enter a token.'); return; }")
-    parts.append('  await postJSON("/config/singular", { token });')
-    parts.append("  await loadConfig();")
-    parts.append("  await pingSingular();")
-    parts.append("  alert('Token saved. Registry refreshed.');")
-    parts.append("};")
-    parts.append("loadConfig();")
-    parts.append("pingSingular();")
+    parts.append("  xhr('POST', '/config/singular/add', { name: name, token: token }, function(status, data) {")
+    parts.append("    if (status === 200) {")
+    parts.append("      nameEl.value = '';")
+    parts.append("      tokenEl.value = '';")
+    parts.append("      loadConfig(function() { pingApp(name); });")
+    parts.append("    } else {")
+    parts.append("      alert((data && data.detail) || 'Failed to add app');")
+    parts.append("    }")
+    parts.append("  });")
+    parts.append("}")
+    parts.append("")
+    # Remove app
+    parts.append("function removeApp(name) {")
+    parts.append("  if (!confirm('Remove app \"' + name + '\"?')) return;")
+    parts.append("  xhr('POST', '/config/singular/remove?name=' + encodeURIComponent(name), null, function(status) {")
+    parts.append("    if (status === 200) {")
+    parts.append("      loadConfig();")
+    parts.append("    } else {")
+    parts.append("      alert('Failed to remove app');")
+    parts.append("    }")
+    parts.append("  });")
+    parts.append("}")
+    parts.append("")
+    # Load events
+    parts.append("function loadEvents() {")
+    parts.append("  xhr('GET', '/events', null, function(status, data) {")
+    parts.append("    var el = document.getElementById('log');")
+    parts.append("    if (status === 200 && data && data.events) {")
+    parts.append("      el.textContent = data.events.join('\\n') || 'No events yet.';")
+    parts.append("    } else {")
+    parts.append("      el.textContent = 'Failed to load events.';")
+    parts.append("    }")
+    parts.append("  });")
+    parts.append("}")
+    parts.append("")
+    # Wire up buttons
+    parts.append("document.getElementById('btn-add').onclick = addApp;")
+    parts.append("document.getElementById('btn-ping-all').onclick = pingAll;")
+    parts.append("document.getElementById('btn-refresh-log').onclick = loadEvents;")
+    parts.append("")
+    # Load data immediately
+    parts.append("loadConfig(pingAll);")
     parts.append("loadEvents();")
     parts.append("</script>")
     parts.append("</body></html>")
@@ -1112,24 +1344,20 @@ def index():
 @app.get("/modules", response_class=HTMLResponse)
 def modules_page():
     parts: List[str] = []
+    parts.append("<!DOCTYPE html>")
     parts.append("<html><head>")
     parts.append("<title>Modules - Elliott's Singular Controls</title>")
     parts.append(_base_style())
     parts.append("<style>")
     parts.append("  .module-card { margin-bottom: 20px; }")
     parts.append("  .module-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }")
-    parts.append("  .module-title { font-size: 18px; font-weight: 600; margin: 0; }")
-    parts.append("  .toggle-switch { position: relative; width: 50px; height: 26px; }")
+    parts.append("  .module-title { font-size: 16px; font-weight: 600; margin: 0; }")
+    parts.append("  .toggle-switch { position: relative; width: 44px; height: 24px; }")
     parts.append("  .toggle-switch input { opacity: 0; width: 0; height: 0; }")
-    parts.append("  .toggle-slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background: #3d3d3d; border-radius: 26px; transition: 0.3s; }")
-    parts.append("  .toggle-slider:before { position: absolute; content: ''; height: 20px; width: 20px; left: 3px; bottom: 3px; background: white; border-radius: 50%; transition: 0.3s; }")
+    parts.append("  .toggle-slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background: #3d3d3d; border-radius: 24px; transition: 0.2s; }")
+    parts.append("  .toggle-slider:before { position: absolute; content: ''; height: 18px; width: 18px; left: 3px; bottom: 3px; background: white; border-radius: 50%; transition: 0.2s; }")
     parts.append("  .toggle-switch input:checked + .toggle-slider { background: #00bcd4; }")
-    parts.append("  .toggle-switch input:checked + .toggle-slider:before { transform: translateX(24px); }")
-    parts.append("  .module-actions { display: flex; gap: 8px; margin-top: 16px; }")
-    parts.append("  .status-text { font-size: 13px; padding: 6px 12px; border-radius: 6px; }")
-    parts.append("  .status-text.success { background: #4caf5030; color: #4caf50; }")
-    parts.append("  .status-text.error { background: #ff525230; color: #ff5252; }")
-    parts.append("  .status-text.idle { background: #88888830; color: #888888; }")
+    parts.append("  .toggle-switch input:checked + .toggle-slider:before { transform: translateX(20px); }")
     parts.append("  @keyframes pulse-warning { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }")
     parts.append("  .disconnect-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.9); display: none; justify-content: center; align-items: center; z-index: 9999; }")
     parts.append("  .disconnect-overlay.active { animation: pulse-warning 1.5s ease-in-out infinite; }")
@@ -1157,7 +1385,7 @@ def modules_page():
     parts.append('<div class="disconnect-status" id="disconnect-status">Attempting to reconnect...</div>')
     parts.append('</div>')
     parts.append('</div>')
-    parts.append(_nav_html())
+    parts.append(_nav_html("Modules"))
     parts.append("<h1>Modules</h1>")
     parts.append("<p>Enable and configure optional modules to extend functionality.</p>")
 
@@ -1190,13 +1418,13 @@ def modules_page():
     parts.append('</div>')
 
     # Action buttons and status (inline)
-    parts.append('<div class="module-actions" style="flex-wrap: wrap; align-items: center;">')
+    parts.append('<div class="btn-row">')
     parts.append('<button type="button" onclick="saveAndRefresh()">Save & Update</button>')
-    parts.append('<button type="button" onclick="refreshTfl()" style="background: #30363d;">Update Now</button>')
-    parts.append('<button type="button" onclick="previewTfl()" style="background: #30363d;">Preview</button>')
-    parts.append('<button type="button" onclick="testTfl()" style="background: #f59e0b;">Send TEST</button>')
-    parts.append('<button type="button" onclick="blankTfl()" style="background: #ef4444;">Send Blank</button>')
-    parts.append('<span id="tfl-status" class="status-text idle" style="margin-left: 12px;">Not updated yet</span>')
+    parts.append('<button type="button" class="secondary" onclick="refreshTfl()">Update Now</button>')
+    parts.append('<button type="button" class="secondary" onclick="previewTfl()">Preview</button>')
+    parts.append('<button type="button" class="warning" onclick="testTfl()">Send TEST</button>')
+    parts.append('<button type="button" class="danger" onclick="blankTfl()">Send Blank</button>')
+    parts.append('<span id="tfl-status" class="status idle">Not updated yet</span>')
     parts.append('</div>')
     parts.append('<pre id="tfl-preview" style="display: none; max-height: 200px; overflow: auto; margin-top: 12px;"></pre>')
 
@@ -1236,10 +1464,10 @@ def modules_page():
     parts.append('</div>')
 
     parts.append('</div>')  # Close tfl-grid
-    parts.append('<div class="module-actions" style="margin-top: 20px;">')
+    parts.append('<div class="btn-row" style="margin-top: 20px;">')
     parts.append('<button type="button" onclick="sendManual()">Send Manual</button>')
-    parts.append('<button type="button" onclick="resetManual()" style="background: #3d3d3d;">Reset All</button>')
-    parts.append('<span id="manual-status" class="status-text idle" style="margin-left: 8px;">Not sent yet</span>')
+    parts.append('<button type="button" class="secondary" onclick="resetManual()">Reset All</button>')
+    parts.append('<span id="manual-status" class="status idle">Not sent yet</span>')
     parts.append('</div>')
     parts.append('</div>')  # Close manual section
     parts.append('</div>')  # Close tfl-content
@@ -1302,22 +1530,20 @@ def modules_page():
         "async function refreshTfl() {",
         '  const status = document.getElementById("tfl-status");',
         '  status.textContent = "Refreshing...";',
-        '  status.className = "status-text idle";',
+        '  status.className = "status idle";',
         "  try {",
         '    const res = await fetch("/update");',
-        '    const autoOn = document.getElementById("auto-refresh").checked;',
-        '    const autoText = autoOn ? " (auto-refresh on)" : "";',
         "    if (res.ok) {",
-        '      status.textContent = "Updated " + new Date().toLocaleTimeString() + autoText;',
-        '      status.className = "status-text success";',
+        '      status.textContent = "Updated " + new Date().toLocaleTimeString();',
+        '      status.className = "status success";',
         "    } else {",
         "      const err = await res.json();",
         '      status.textContent = err.detail || "Error";',
-        '      status.className = "status-text error";',
+        '      status.className = "status error";',
         "    }",
         "  } catch (e) {",
         '    status.textContent = "Failed: " + e.message;',
-        '    status.className = "status-text error";',
+        '    status.className = "status error";',
         "  }",
         "}",
         "",
@@ -1325,57 +1551,57 @@ def modules_page():
         '  const preview = document.getElementById("tfl-preview");',
         '  const status = document.getElementById("tfl-status");',
         '  status.textContent = "Fetching preview...";',
-        '  status.className = "status-text idle";',
+        '  status.className = "status idle";',
         "  try {",
         '    const res = await fetch("/status");',
         "    const data = await res.json();",
         '    preview.textContent = JSON.stringify(data, null, 2);',
         '    preview.style.display = "block";',
         '    status.textContent = "Preview loaded (not sent)";',
-        '    status.className = "status-text idle";',
+        '    status.className = "status idle";',
         "  } catch (e) {",
         '    status.textContent = "Preview failed: " + e.message;',
-        '    status.className = "status-text error";',
+        '    status.className = "status error";',
         "  }",
         "}",
         "",
         "async function testTfl() {",
         '  const status = document.getElementById("tfl-status");',
         '  status.textContent = "Sending TEST...";',
-        '  status.className = "status-text idle";',
+        '  status.className = "status idle";',
         "  try {",
         '    const res = await fetch("/test");',
         "    if (res.ok) {",
         '      status.textContent = "TEST sent " + new Date().toLocaleTimeString();',
-        '      status.className = "status-text success";',
+        '      status.className = "status success";',
         "    } else {",
         "      const err = await res.json();",
         '      status.textContent = err.detail || "Error";',
-        '      status.className = "status-text error";',
+        '      status.className = "status error";',
         "    }",
         "  } catch (e) {",
         '    status.textContent = "Failed: " + e.message;',
-        '    status.className = "status-text error";',
+        '    status.className = "status error";',
         "  }",
         "}",
         "",
         "async function blankTfl() {",
         '  const status = document.getElementById("tfl-status");',
         '  status.textContent = "Sending blank...";',
-        '  status.className = "status-text idle";',
+        '  status.className = "status idle";',
         "  try {",
         '    const res = await fetch("/blank");',
         "    if (res.ok) {",
         '      status.textContent = "Blank sent " + new Date().toLocaleTimeString();',
-        '      status.className = "status-text success";',
+        '      status.className = "status success";',
         "    } else {",
         "      const err = await res.json();",
         '      status.textContent = err.detail || "Error";',
-        '      status.className = "status-text error";',
+        '      status.className = "status error";',
         "    }",
         "  } catch (e) {",
         '    status.textContent = "Failed: " + e.message;',
-        '    status.className = "status-text error";',
+        '    status.className = "status error";',
         "  }",
         "}",
         "",
@@ -1404,7 +1630,7 @@ def modules_page():
         "async function sendManual() {",
         '  var status = document.getElementById("manual-status");',
         '  status.textContent = "Sending...";',
-        '  status.className = "status-text idle";',
+        '  status.className = "status idle";',
         "  try {",
         "    var payload = getManualPayload();",
         '    var res = await fetch("/manual", {',
@@ -1414,15 +1640,15 @@ def modules_page():
         "    });",
         "    if (res.ok) {",
         '      status.textContent = "Updated " + new Date().toLocaleTimeString();',
-        '      status.className = "status-text success";',
+        '      status.className = "status success";',
         "    } else {",
         "      var err = await res.json();",
         '      status.textContent = err.detail || "Error";',
-        '      status.className = "status-text error";',
+        '      status.className = "status error";',
         "    }",
         "  } catch (e) {",
         '    status.textContent = "Failed: " + e.message;',
-        '    status.className = "status-text error";',
+        '    status.className = "status error";',
         "  }",
         "}",
         "",
@@ -1436,7 +1662,7 @@ def modules_page():
         "    }",
         "  });",
         '  document.getElementById("manual-status").textContent = "Reset";',
-        '  document.getElementById("manual-status").className = "status-text idle";',
+        '  document.getElementById("manual-status").className = "status idle";',
         "}",
     ]
     parts.append("\n".join(js_lines))
@@ -1509,6 +1735,7 @@ def integrations_redirect():
 def tfl_manual_standalone():
     """Standalone TFL manual control page for external operators."""
     parts: List[str] = []
+    parts.append("<!DOCTYPE html>")
     parts.append("<html><head>")
     parts.append("<title>TfL Line Status Control</title>")
     parts.append('<link rel="icon" type="image/x-icon" href="/static/favicon.ico">')
@@ -1636,6 +1863,7 @@ def tfl_manual_standalone():
 def commands_page(request: Request):
     base = _base_url(request)
     parts: List[str] = []
+    parts.append("<!DOCTYPE html>")
     parts.append("<html><head>")
     parts.append("<title>Commands - Elliott's Singular Controls</title>")
     parts.append(_base_style())
@@ -1643,9 +1871,14 @@ def commands_page(request: Request):
     parts.append("  .copyable { cursor: pointer; transition: all 0.2s; padding: 4px 8px; border-radius: 4px; }")
     parts.append("  .copyable:hover { background: #00bcd4; color: #fff; }")
     parts.append("  .copyable.copied { background: #4caf50; color: #fff; }")
+    parts.append("  .value-input { width: 100%; padding: 6px 10px; border: 1px solid #30363d; border-radius: 4px; background: #21262d; color: #e6edf3; font-size: 13px; box-sizing: border-box; }")
+    parts.append("  .value-input:focus { outline: none; border-color: #00bcd4; box-shadow: 0 0 0 2px rgba(0,188,212,0.2); }")
+    parts.append("  .value-input::placeholder { color: #666; }")
+    parts.append("  button.play-btn { background: #238636; border: none; color: #fff; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 14px; }")
+    parts.append("  button.play-btn:hover { background: #2ea043; }")
     parts.append("</style>")
     parts.append("</head><body>")
-    parts.append(_nav_html())
+    parts.append(_nav_html("Commands"))
     parts.append("<h1>Singular Commands</h1>")
     parts.append("<p>This view focuses on simple <strong>GET</strong> triggers you can use in automation systems.</p>")
     parts.append("<p>Base URL: <code>" + html_escape(base) + "</code></p>")
@@ -1681,7 +1914,8 @@ def commands_page(request: Request):
     parts.append("  if (!entries.length) { container.textContent = 'No matches.'; return; }")
     parts.append("  let html = '';")
     parts.append("  for (const [key, item] of entries) {")
-    parts.append("    html += '<h3>' + item.name + ' <small>(' + key + ')</small></h3>';")
+    parts.append("    const appBadge = item.app_name ? '<span style=\"background:#00bcd4;color:#fff;padding:2px 8px;border-radius:4px;font-size:11px;margin-left:8px;\">' + item.app_name + '</span>' : '';")
+    parts.append("    html += '<h3>' + item.name + appBadge + ' <small style=\"color:#888;\">(' + key + ')</small></h3>';")
     parts.append("    html += '<table><tr><th>Action</th><th>GET URL</th><th style=\"width:60px;text-align:center;\">Test</th></tr>';")
     parts.append("    html += '<tr><td>IN</td><td><code class=\"copyable\" onclick=\"copyToClipboard(this)\" title=\"Click to copy\">' + item.in_url + '</code></td>' +")
     parts.append("            '<td style=\"text-align:center;\"><a href=\"' + item.in_url + '\" target=\"_blank\" class=\"play-btn\" title=\"Test IN\">▶</a></td></tr>';")
@@ -1692,25 +1926,30 @@ def commands_page(request: Request):
     parts.append("    const fkeys = Object.keys(fields);")
     parts.append("    if (fkeys.length) {")
     parts.append("      html += '<p><strong>Fields:</strong></p>';")
-    parts.append("      html += '<table><tr><th>Field</th><th>Type</th><th>Command URL</th><th style=\"width:60px;text-align:center;\">Test</th></tr>';")
+    parts.append("      html += '<table><tr><th>Field</th><th>Type</th><th>Command URL</th><th style=\"width:200px;\">Test Value</th><th style=\"width:60px;text-align:center;\">Test</th></tr>';")
     parts.append("      for (const fid of fkeys) {")
     parts.append("        const ex = fields[fid];")
     parts.append("        if (ex.timecontrol_start_url) {")
     parts.append("          html += '<tr><td rowspan=\"3\">' + fid + '</td><td rowspan=\"3\">⏱ Timer</td>';")
     parts.append("          html += '<td><code class=\"copyable\" onclick=\"copyToClipboard(this)\" title=\"Click to copy\">' + ex.timecontrol_start_url + '</code></td>';")
+    parts.append("          html += '<td></td>';")
     parts.append("          html += '<td style=\"text-align:center;\"><a href=\"' + ex.timecontrol_start_url + '\" target=\"_blank\" class=\"play-btn\" title=\"Start Timer\">▶</a></td></tr>';")
     parts.append("          html += '<tr><td><code class=\"copyable\" onclick=\"copyToClipboard(this)\" title=\"Click to copy\">' + ex.timecontrol_stop_url + '</code></td>';")
+    parts.append("          html += '<td></td>';")
     parts.append("          html += '<td style=\"text-align:center;\"><a href=\"' + ex.timecontrol_stop_url + '\" target=\"_blank\" class=\"play-btn\" title=\"Stop Timer\">▶</a></td></tr>';")
     parts.append("          if (ex.start_10s_if_supported) {")
     parts.append("            html += '<tr><td><code class=\"copyable\" onclick=\"copyToClipboard(this)\" title=\"Click to copy\">' + ex.start_10s_if_supported + '</code></td>';")
+    parts.append("            html += '<td></td>';")
     parts.append("            html += '<td style=\"text-align:center;\"><a href=\"' + ex.start_10s_if_supported + '\" target=\"_blank\" class=\"play-btn\" title=\"Start 10s\">▶</a></td></tr>';")
     parts.append("          } else {")
-    parts.append("            html += '<tr><td colspan=\"2\" style=\"color:#666;\">Duration param not supported</td></tr>';")
+    parts.append("            html += '<tr><td colspan=\"3\" style=\"color:#666;\">Duration param not supported</td></tr>';")
     parts.append("          }")
     parts.append("        } else if (ex.set_url) {")
+    parts.append("          const fieldId = key + '_' + fid;")
     parts.append("          html += '<tr><td>' + fid + '</td><td>Value</td>';")
     parts.append("          html += '<td><code class=\"copyable\" onclick=\"copyToClipboard(this)\" title=\"Click to copy\">' + ex.set_url + '</code></td>';")
-    parts.append("          html += '<td style=\"text-align:center;\"><a href=\"' + ex.set_url + '\" target=\"_blank\" class=\"play-btn\" title=\"Set Value\">▶</a></td></tr>';")
+    parts.append("          html += '<td><input type=\"text\" id=\"val_' + fieldId + '\" class=\"value-input\" placeholder=\"Enter value...\" data-base-url=\"' + ex.set_url + '\" /></td>';")
+    parts.append("          html += '<td style=\"text-align:center;\"><button type=\"button\" class=\"play-btn\" onclick=\"testValue(\\'' + fieldId + '\\')\" title=\"Send Value\">▶</button></td></tr>';")
     parts.append("        }")
     parts.append("      }")
     parts.append("      html += '</table>';")
@@ -1758,6 +1997,30 @@ def commands_page(request: Request):
     parts.append("    }, 1500);")
     parts.append("  });")
     parts.append("}")
+    parts.append("async function testValue(fieldId) {")
+    parts.append("  const input = document.getElementById('val_' + fieldId);")
+    parts.append("  if (!input) { alert('Input not found'); return; }")
+    parts.append("  const value = input.value.trim();")
+    parts.append("  if (!value) { alert('Please enter a value to test'); return; }")
+    parts.append("  const baseUrl = input.getAttribute('data-base-url');")
+    parts.append("  const url = baseUrl.replace('VALUE', encodeURIComponent(value));")
+    parts.append("  try {")
+    parts.append("    input.style.borderColor = '#00bcd4';")
+    parts.append("    const res = await fetch(url);")
+    parts.append("    if (res.ok) {")
+    parts.append("      input.style.borderColor = '#4caf50';")
+    parts.append("      setTimeout(() => { input.style.borderColor = ''; }, 2000);")
+    parts.append("    } else {")
+    parts.append("      input.style.borderColor = '#f44336';")
+    parts.append("      alert('Request failed: ' + res.status);")
+    parts.append("      setTimeout(() => { input.style.borderColor = ''; }, 2000);")
+    parts.append("    }")
+    parts.append("  } catch (e) {")
+    parts.append("    input.style.borderColor = '#f44336';")
+    parts.append("    alert('Error: ' + e.message);")
+    parts.append("    setTimeout(() => { input.style.borderColor = ''; }, 2000);")
+    parts.append("  }")
+    parts.append("}")
     parts.append("document.addEventListener('DOMContentLoaded', () => {")
     parts.append('  document.getElementById("cmd-filter").addEventListener("input", renderCommands);')
     parts.append('  document.getElementById("cmd-sort").addEventListener("change", renderCommands);')
@@ -1771,11 +2034,12 @@ def commands_page(request: Request):
 @app.get("/settings", response_class=HTMLResponse)
 def settings_page():
     parts: List[str] = []
+    parts.append("<!DOCTYPE html>")
     parts.append("<html><head>")
     parts.append("<title>Settings - Elliott's Singular Controls</title>")
     parts.append(_base_style())
     parts.append("</head><body>")
-    parts.append(_nav_html())
+    parts.append(_nav_html("Settings"))
     parts.append("<h1>Settings</h1>")
     # Theme toggle styles
     parts.append("<style>")
