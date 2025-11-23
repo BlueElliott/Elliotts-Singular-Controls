@@ -2,14 +2,56 @@
 
 ## Project Overview
 **Name:** Elliott's Singular Controls (formerly Singular Tweaks)
-**Version:** 1.1.0
+**Version:** 1.1.0 (TriCaster module in development)
 **Repository:** https://github.com/BlueElliott/Elliotts-Singular-Controls
 
-A premium desktop application for controlling Singular.live graphics with TfL integration.
+A premium desktop application for controlling Singular.live graphics with TfL and TriCaster integration.
 
 ---
 
-## What's New in v1.1.0
+## What's New (Unreleased - In Development)
+
+### TriCaster Module
+A new module for integrating with NewTek/Vizrt TriCaster systems:
+
+1. **TriCaster Connection**
+   - Connect to any TriCaster on the network via HTTP API
+   - Configurable host, username, and password
+   - Test connection functionality
+
+2. **DDR-to-Singular Timer Sync**
+   - Read DDR durations from TriCaster (`/v1/dictionary?key=ddr_timecode`)
+   - Sync durations to Singular timer controls (minutes + seconds fields)
+   - Support for 4 DDRs with configurable field mappings
+   - Frame-accurate rounding option (rounds to frame boundaries based on clip FPS)
+   - Timer controls: Start, Pause, Reset, Restart (pause + reset)
+
+3. **Configuration**
+   - `tricaster_host` - TriCaster IP/hostname
+   - `tricaster_user` - Username (default: "admin")
+   - `tricaster_pass` - Password
+   - `tricaster_singular_token` - Singular Control App token for timer sync
+   - `tricaster_timer_fields` - DDR-to-field mappings
+   - `tricaster_round_mode` - "frames" or "none"
+
+4. **API Endpoints**
+   ```
+   POST /config/module/tricaster     - Enable/disable module
+   POST /config/tricaster            - Save connection settings
+   GET  /tricaster/test              - Test connection
+   GET  /config/tricaster/timer-sync - Get timer sync config
+   POST /config/tricaster/timer-sync - Save timer sync config
+   GET  /tricaster/sync/{ddr_num}    - Sync single DDR to Singular
+   GET  /tricaster/sync/all          - Sync all configured DDRs
+   GET  /tricaster/timer/{ddr}/start - Start timer
+   GET  /tricaster/timer/{ddr}/pause - Pause timer
+   GET  /tricaster/timer/{ddr}/reset - Reset timer
+   GET  /tricaster/timer/{ddr}/restart - Restart (pause + reset)
+   ```
+
+---
+
+## What's in v1.1.0
 
 ### Major Improvements
 
@@ -69,76 +111,75 @@ Elliotts-Singular-Controls/
 
 ## Critical Technical Details
 
+### TriCaster API Integration
+The TriCaster module uses the TriCaster HTTP API:
+
+```python
+# Dictionary endpoint for DDR timecodes
+GET http://{host}/v1/dictionary?key=ddr_timecode
+
+# Response XML contains DDR info:
+# <ddr index="1" file_duration="00:01:30.00" clip_framerate="29.97" ...>
+
+# Shortcut endpoint for commands
+POST http://{host}/v1/shortcut
+# Body: <shortcut name='command'><entry key='param' value='val'/></shortcut>
+```
+
+### DDR Duration Parsing
+```python
+def _timecode_to_seconds(timecode: str) -> float:
+    # Handles: "HH:MM:SS.ff", "MM:SS.ff", or raw seconds
+
+def _split_minutes_seconds(total_seconds: float, fps: float) -> Tuple[int, float]:
+    # Optionally rounds to frame boundaries
+    if round_mode == "frames" and fps > 0:
+        total_seconds = round(total_seconds * fps) / fps
+```
+
+### Singular Timer Sync
+```python
+# Field mappings per DDR:
+tricaster_timer_fields = {
+    "1": {"min": "SVR A Duration Time Minutes",
+          "sec": "SVR A Start Duration Seconds",
+          "timer": "SVR A Start Timer"},
+    "2": {...},
+}
+
+# Sync patches Singular Control App:
+PATCH /controlapps/{token}/control
+[{"subCompositionId": "...", "payload": {"field_id": value}}]
+```
+
 ### PyInstaller Spec File Location
 **IMPORTANT:** The `ElliottsSingularControls.spec` file MUST be in the repository root directory.
 
-PyInstaller resolves relative paths from the spec file's location. The GitHub Actions workflow runs:
-```yaml
-pyinstaller ElliottsSingularControls.spec
-```
-
 ### PIL Anti-Aliased Pulse Animation
-The pulse indicator uses PIL for smooth graphics:
-
 ```python
 # Draw at 4x resolution
 big_size = 40 * 4  # 160 pixels
-
-# Create image and draw circles
 img = Image.new('RGB', (big_size, big_size), bg_color)
 draw = ImageDraw.Draw(img)
 draw.ellipse([...], outline=color, width=ring_width)
-
-# Resize with anti-aliasing
 img = img.resize((40, 40), Image.LANCZOS)
-
-# Convert to PhotoImage for Tkinter
-self.pulse_image = ImageTk.PhotoImage(img)
-```
-
-Key: Background color must match exactly (#1a1a1a = rgb(26, 26, 26))
-
-### Ripple Animation Logic
-```python
-# Phase offsets create outward ripple effect
-center_phase = self.pulse_angle
-inner_phase = self.pulse_angle - 90   # 90 degree delay
-outer_phase = self.pulse_angle - 180  # 180 degree delay
-
-# Opacity calculated from sine wave (0 to 1)
-opacity = (math.sin(math.radians(phase)) + 1) / 2
-
-# Color blending simulates transparency
-color = blend(bg_color, blue_color, opacity)
 ```
 
 ### CSS Specificity for TFL Inputs
 - **modules page:** `.tfl-input { background: #0c6473; }` - NO `!important`
 - **standalone page:** `.line-input { background: #0c6473; }` - NO `!important`
 
-JavaScript changes background to `#db422d` (red) for non-"Good Service" values.
-
-### Version Bumping
-Version is defined in `elliotts_singular_controls/__init__.py`:
-```python
-__version__ = "1.1.0"
-```
-
-Also update fallback version in `ElliottsSingularControls.spec`.
-
 ---
 
 ## Key Files and Their Purposes
 
 ### `elliotts_singular_controls/core.py`
-- **Lines 1-150:** Imports, constants, TFL line definitions and colours
-- **Lines 500-600:** Base CSS styles (`_base_style()` function)
-- **Lines 780-850:** TFL/DataStream API endpoints
-- **Lines 1000-1110:** Home page (`/`)
-- **Lines 1112-1500:** Modules page (`/modules`)
-- **Lines 1508-1632:** Standalone TFL control page (`/tfl/control`)
-- **Lines 1635-1770:** Commands page (`/commands`)
-- **Lines 1771-1890:** Settings page (`/settings`)
+- **Lines 1-200:** Imports, constants, AppConfig (includes TriCaster settings)
+- **Lines 300-430:** TriCaster API helper functions
+- **Lines 435-685:** DDR-to-Singular timer sync functions
+- **Lines 1200-1390:** TriCaster API endpoints
+- **Lines 2100-2200:** TriCaster UI on Modules page
+- **Lines 2400-2550:** TriCaster JavaScript functions
 
 ### `elliotts_singular_controls/gui_launcher.py`
 - System tray application using pystray
@@ -151,7 +192,6 @@ Also update fallback version in `ElliottsSingularControls.spec`.
 - Triggered on tag push (`v*.*.*`)
 - Builds Windows executable with PyInstaller
 - Creates GitHub Release with the exe
-- Attempts PyPI publish (requires `PYPI_API_TOKEN` secret)
 
 ---
 
@@ -187,8 +227,8 @@ pyinstaller ElliottsSingularControls.spec
    ```
 6. **Create and push tag:**
    ```bash
-   git tag v1.1.0
-   git push origin v1.1.0
+   git tag v1.2.0
+   git push origin v1.2.0
    ```
 7. **Monitor GitHub Actions:** https://github.com/BlueElliott/Elliotts-Singular-Controls/actions
 
@@ -198,7 +238,7 @@ pyinstaller ElliottsSingularControls.spec
 
 When running locally on port 3113:
 - **Home:** http://localhost:3113/
-- **Modules (TFL):** http://localhost:3113/modules
+- **Modules (TFL + TriCaster):** http://localhost:3113/modules
 - **Standalone TFL Control:** http://localhost:3113/tfl/control
 - **Commands:** http://localhost:3113/commands
 - **Settings:** http://localhost:3113/settings
@@ -207,48 +247,36 @@ When running locally on port 3113:
 
 ## Common Issues and Solutions
 
+### Issue: TriCaster connection fails
+**Solution:** Check that:
+- TriCaster is on and network accessible
+- IP address is correct
+- Credentials are correct (default: admin with no password)
+- TriCaster HTTP API is enabled
+
+### Issue: DDR sync shows "duration not found"
+**Solution:** Ensure the DDR has a clip loaded. The API only returns duration for loaded clips.
+
+### Issue: Singular timer not updating
+**Solution:** Verify:
+- Control App token is correct
+- Field IDs match exactly (case-sensitive)
+- Singular composition is published and running
+
 ### Issue: TFL input background not changing color
 **Solution:** Check that CSS for `.tfl-input` doesn't have `!important` on background.
 
 ### Issue: PyInstaller can't find `__main__.py`
 **Solution:** Ensure `ElliottsSingularControls.spec` is in repository ROOT.
 
-### Issue: Pulse indicator has visible box/border
-**Solution:** Background color in PIL must match exactly: rgb(26, 26, 26). Label needs `bd=0, highlightthickness=0`.
-
-### Issue: Rounded rectangles have seam lines
-**Solution:** Use `outline=fill` for all canvas shapes to eliminate gaps.
-
-### Issue: GitHub Actions build fails
-**Solution:** Check error in Actions log. Common issues:
-- Spec file path wrong
-- Missing dependencies in requirements.txt
-- Version import failing
-
----
-
-## Desktop GUI Features
-
-### Pulse Indicator
-- **Running:** Blue rippling animation (3 elements)
-- **Stopped:** Static gray circles
-- **Animation:** 40ms refresh rate, 8 degree increments
-
-### Port Card
-- Displays current server port
-- Click "Change Port" to modify
-- Rounded rectangle with smooth edges
-
-### Buttons
-- **Open Web GUI** - Blue, launches browser
-- **Open Console** - Gray, shows server logs
-- **Restart Server** - Orange, restarts without closing
-- **Hide to Tray** - Gray, minimizes to system tray
-- **Quit Server** - Red, closes application
-
 ---
 
 ## Version History
+
+### v1.2.0 (Planned)
+- TriCaster module with DDR-to-Singular timer sync
+- Connection settings and test functionality
+- Individual DDR sync and timer controls
 
 ### v1.1.0 (Current)
 - Smooth anti-aliased pulse indicator using PIL

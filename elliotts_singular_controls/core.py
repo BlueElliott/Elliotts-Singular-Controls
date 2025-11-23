@@ -192,6 +192,15 @@ class AppConfig(BaseModel):
     tfl_app_key: Optional[str] = None
     enable_tfl: bool = False  # Disabled by default for new installs
     tfl_auto_refresh: bool = False  # Auto-refresh TFL data every 60s
+    # TriCaster module settings
+    enable_tricaster: bool = False
+    tricaster_host: Optional[str] = None
+    tricaster_user: str = "admin"
+    tricaster_pass: Optional[str] = None
+    # DDR-to-Singular Timer Sync settings
+    tricaster_singular_token: Optional[str] = None  # Control App token for timer sync
+    tricaster_timer_fields: Dict[str, Dict[str, str]] = {}  # DDR mappings: {"1": {"min": "field_id", "sec": "field_id", "timer": "field_id"}}
+    tricaster_round_mode: str = "frames"  # "frames" or "none" - whether to round to frame boundaries
     theme: str = "dark"
     port: Optional[int] = None
 
@@ -205,6 +214,15 @@ def load_config() -> AppConfig:
         "tfl_app_key": os.getenv("TFL_APP_KEY") or None,
         "enable_tfl": False,  # Disabled by default
         "tfl_auto_refresh": False,
+        # TriCaster defaults
+        "enable_tricaster": False,
+        "tricaster_host": os.getenv("TRICASTER_HOST") or None,
+        "tricaster_user": os.getenv("TRICASTER_USER", "admin"),
+        "tricaster_pass": os.getenv("TRICASTER_PASS") or None,
+        # DDR-to-Singular Timer Sync defaults
+        "tricaster_singular_token": os.getenv("TRICASTER_SINGULAR_TOKEN") or None,
+        "tricaster_timer_fields": {},
+        "tricaster_round_mode": os.getenv("TRICASTER_ROUND_MODE", "frames"),
         "theme": "dark",
         "port": int(os.getenv("SINGULAR_TWEAKS_PORT")) if os.getenv("SINGULAR_TWEAKS_PORT") else None,
     }
@@ -291,6 +309,377 @@ def fetch_all_line_statuses() -> Dict[str, str]:
     except requests.RequestException as e:
         logger.error("TfL API request failed: %s", e)
         raise HTTPException(503, f"TfL API request failed: {str(e)}")
+
+
+# ================== TRICASTER API HELPERS ==================
+
+import xml.etree.ElementTree as ET
+from requests.auth import HTTPBasicAuth
+
+def tricaster_request(endpoint: str, method: str = "GET", data: str = None) -> requests.Response:
+    """Make a request to the TriCaster API."""
+    if not CONFIG.enable_tricaster:
+        raise HTTPException(400, "TriCaster module is disabled")
+    if not CONFIG.tricaster_host:
+        raise HTTPException(400, "TriCaster host not configured")
+
+    url = f"http://{CONFIG.tricaster_host}{endpoint}"
+    auth = None
+    if CONFIG.tricaster_user and CONFIG.tricaster_pass:
+        auth = HTTPBasicAuth(CONFIG.tricaster_user, CONFIG.tricaster_pass)
+
+    headers = {"Connection": "close", "Accept": "application/xml"}
+    if method == "POST" and data:
+        headers["Content-Type"] = "text/xml"
+
+    try:
+        if method == "GET":
+            resp = requests.get(url, auth=auth, headers=headers, timeout=6)
+        else:
+            resp = requests.post(url, auth=auth, headers=headers, data=data, timeout=6)
+        resp.raise_for_status()
+        return resp
+    except requests.RequestException as e:
+        logger.error("TriCaster request failed: %s", e)
+        raise HTTPException(503, f"TriCaster request failed: {str(e)}")
+
+
+def tricaster_shortcut(name: str, params: Dict[str, str] = None) -> Dict[str, Any]:
+    """Execute a TriCaster shortcut command."""
+    xml_parts = [f"<shortcut name='{name}'>"]
+    if params:
+        for key, value in params.items():
+            xml_parts.append(f"<entry key='{key}' value='{value}'/>")
+    xml_parts.append("</shortcut>")
+    xml_data = "".join(xml_parts)
+
+    resp = tricaster_request("/v1/shortcut", method="POST", data=xml_data)
+    return {"ok": True, "command": name, "params": params}
+
+
+def tricaster_get_dictionary(key: str) -> Dict[str, Any]:
+    """Get data from TriCaster dictionary (timecodes, status, etc)."""
+    resp = tricaster_request(f"/v1/dictionary?key={key}")
+    return {"raw_xml": resp.text}
+
+
+def tricaster_get_ddr_info() -> Dict[str, Any]:
+    """Get DDR timecode and duration info from TriCaster."""
+    try:
+        resp = tricaster_request("/v1/dictionary?key=ddr_timecode")
+        xml_text = resp.text
+        root = ET.fromstring(xml_text)
+
+        ddr_info = {}
+        for i in range(1, 5):  # DDR1-4
+            # Try different XML formats
+            el = root.find(f".//ddr[@index='{i}']") or root.find(f".//ddr{i}")
+            if el is not None:
+                info = {
+                    "duration": el.get("file_duration") or el.get("duration"),
+                    "elapsed": el.get("clip_seconds_elapsed"),
+                    "remaining": el.get("clip_seconds_remaining"),
+                    "framerate": el.get("clip_framerate"),
+                    "playing": el.get("playing", "false") == "true",
+                    "filename": el.get("filename") or el.get("clip_name"),
+                }
+                ddr_info[f"ddr{i}"] = info
+
+        return {"ok": True, "ddrs": ddr_info}
+    except ET.ParseError as e:
+        logger.error("Failed to parse TriCaster XML: %s", e)
+        return {"ok": False, "error": f"XML parse error: {str(e)}"}
+    except Exception as e:
+        logger.error("TriCaster DDR info failed: %s", e)
+        raise HTTPException(503, f"TriCaster DDR info failed: {str(e)}")
+
+
+def tricaster_get_tally() -> Dict[str, Any]:
+    """Get current program/preview tally status from TriCaster."""
+    try:
+        resp = tricaster_request("/v1/dictionary?key=tally")
+        xml_text = resp.text
+        root = ET.fromstring(xml_text)
+
+        tally = {
+            "program": [],
+            "preview": [],
+        }
+
+        # Parse tally data - format varies by TriCaster model
+        for el in root.iter():
+            if el.get("on_pgm") == "true" or el.get("program") == "true":
+                tally["program"].append(el.tag or el.get("name", "unknown"))
+            if el.get("on_pvw") == "true" or el.get("preview") == "true":
+                tally["preview"].append(el.tag or el.get("name", "unknown"))
+
+        return {"ok": True, "tally": tally}
+    except Exception as e:
+        logger.error("TriCaster tally failed: %s", e)
+        return {"ok": False, "error": str(e)}
+
+
+def tricaster_test_connection() -> Dict[str, Any]:
+    """Test connection to TriCaster."""
+    if not CONFIG.tricaster_host:
+        return {"ok": False, "error": "No TriCaster host configured"}
+
+    try:
+        resp = tricaster_request("/v1/version")
+        return {"ok": True, "host": CONFIG.tricaster_host, "response": resp.text[:200]}
+    except HTTPException as e:
+        return {"ok": False, "error": e.detail}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DDR-to-Singular Timer Sync Functions
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Cache for Singular field-to-subcomposition mappings (per token)
+_singular_field_map_cache: Dict[str, Dict[str, str]] = {}
+
+
+def _timecode_to_seconds(timecode: Optional[str]) -> Optional[float]:
+    """Convert timecode string (HH:MM:SS.ff or MM:SS.ff or seconds) to float seconds."""
+    if timecode is None:
+        return None
+    s = str(timecode).strip()
+    if not s:
+        return None
+    if ":" in s:
+        parts = s.split(":")
+        if len(parts) == 3:
+            h, m, sec = parts
+            return int(h) * 3600 + int(m) * 60 + float(sec)
+        if len(parts) == 2:
+            m, sec = parts
+            return int(m) * 60 + float(sec)
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _split_minutes_seconds(total_seconds: float, fps: Optional[float]) -> Tuple[int, float]:
+    """Split total seconds into minutes and seconds, optionally rounding to frame boundaries."""
+    ts = max(0.0, float(total_seconds))
+    if CONFIG.tricaster_round_mode.lower() == "frames" and fps and fps > 0:
+        ts = round(ts * fps) / fps
+    minutes = int(ts // 60)
+    seconds = ts - minutes * 60
+    seconds = round(seconds + 1e-9, 2)
+    if seconds >= 60.0:
+        minutes += 1
+        seconds = 0.0
+    return minutes, seconds
+
+
+def _get_ddr_duration_and_fps(ddr_index: int) -> Tuple[float, Optional[float]]:
+    """Get duration and FPS for a specific DDR from TriCaster."""
+    if not CONFIG.enable_tricaster:
+        raise HTTPException(400, "TriCaster module is disabled")
+    if not CONFIG.tricaster_host:
+        raise HTTPException(400, "TriCaster host not configured")
+
+    # Try both dictionary keys
+    for key in ["ddr_timecode", "timecode"]:
+        try:
+            resp = tricaster_request(f"/v1/dictionary?key={key}")
+            root = ET.fromstring(resp.text)
+
+            # Try format: <ddr index="1" ...>
+            el = root.find(f".//ddr[@index='{ddr_index}']")
+            if el is not None:
+                dur = _timecode_to_seconds(el.get("file_duration") or el.get("duration"))
+                fps = None
+                if el.get("clip_framerate"):
+                    try:
+                        fps = float(el.get("clip_framerate"))
+                    except ValueError:
+                        pass
+                if dur is not None:
+                    return dur, fps
+
+            # Try format: <ddr1 ...>
+            el = root.find(f".//ddr{ddr_index}")
+            if el is not None:
+                dur = _timecode_to_seconds(el.get("file_duration") or el.get("duration"))
+                if dur is None:
+                    # Calculate from elapsed + remaining
+                    elapsed = el.get("clip_seconds_elapsed")
+                    remaining = el.get("clip_seconds_remaining")
+                    if elapsed and remaining:
+                        try:
+                            dur = float(elapsed) + float(remaining)
+                        except ValueError:
+                            pass
+                fps = None
+                if el.get("clip_framerate"):
+                    try:
+                        fps = float(el.get("clip_framerate"))
+                    except ValueError:
+                        pass
+                if dur is not None:
+                    return dur, fps
+        except Exception:
+            continue
+
+    raise HTTPException(404, f"DDR{ddr_index} duration not found in TriCaster data")
+
+
+def _get_singular_model(token: str) -> list:
+    """Fetch the Singular control app model."""
+    url = f"{SINGULAR_API_BASE}/controlapps/{token}/model"
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _build_singular_field_map(token: str, field_ids: List[str]) -> Dict[str, str]:
+    """Build a mapping of field IDs to their subcomposition IDs."""
+    needed = set(field_ids)
+    mapping: Dict[str, str] = {}
+    data = _get_singular_model(token)
+
+    for comp in data:
+        comp_id = comp.get("id")
+        for node in comp.get("model", []):
+            node_id = node.get("id")
+            if node_id in needed:
+                mapping[node_id] = comp_id
+        for sub in comp.get("subcompositions", []):
+            sub_id = sub.get("id")
+            for node in sub.get("model", []):
+                node_id = node.get("id")
+                if node_id in needed:
+                    mapping[node_id] = sub_id
+
+    return mapping
+
+
+def _ensure_singular_field_map(token: str, field_ids: List[str]) -> Dict[str, str]:
+    """Ensure we have a cached field map for the given token and fields."""
+    cache_key = f"{token}:{','.join(sorted(field_ids))}"
+    if cache_key not in _singular_field_map_cache:
+        _singular_field_map_cache[cache_key] = _build_singular_field_map(token, field_ids)
+    return _singular_field_map_cache[cache_key]
+
+
+def _patch_singular_fields(token: str, field_values: Dict[str, Any]) -> Dict[str, Any]:
+    """Patch Singular fields with values, grouping by subcomposition."""
+    field_ids = list(field_values.keys())
+    field_map = _ensure_singular_field_map(token, field_ids)
+
+    # Group fields by subcomposition
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for field_id, value in field_values.items():
+        sub_id = field_map.get(field_id)
+        if sub_id:
+            grouped.setdefault(sub_id, {})[field_id] = value
+
+    # Build payload
+    body = [{"subCompositionId": sub_id, "payload": payload} for sub_id, payload in grouped.items()]
+
+    url = f"{SINGULAR_API_BASE}/controlapps/{token}/control"
+    resp = requests.patch(url, json=body, timeout=10)
+    resp.raise_for_status()
+    try:
+        return resp.json()
+    except Exception:
+        return {"success": True}
+
+
+def sync_ddr_to_singular(ddr_num: int) -> Dict[str, Any]:
+    """Sync a DDR's duration to Singular timer fields."""
+    token = CONFIG.tricaster_singular_token
+    if not token:
+        raise HTTPException(400, "No Singular token configured for timer sync")
+
+    ddr_key = str(ddr_num)
+    fields = CONFIG.tricaster_timer_fields.get(ddr_key)
+    if not fields:
+        raise HTTPException(400, f"No timer fields configured for DDR {ddr_num}")
+
+    min_field = fields.get("min")
+    sec_field = fields.get("sec")
+    if not min_field or not sec_field:
+        raise HTTPException(400, f"DDR {ddr_num} missing 'min' or 'sec' field configuration")
+
+    # Get duration from TriCaster
+    duration, fps = _get_ddr_duration_and_fps(ddr_num)
+    minutes, seconds = _split_minutes_seconds(duration, fps)
+
+    # Patch Singular fields
+    field_values = {
+        min_field: int(minutes),
+        sec_field: float(seconds),
+    }
+    _patch_singular_fields(token, field_values)
+
+    return {
+        "ok": True,
+        "ddr": ddr_num,
+        "duration_seconds": duration,
+        "minutes": minutes,
+        "seconds": seconds,
+        "fps": fps,
+        "round_mode": CONFIG.tricaster_round_mode,
+    }
+
+
+def sync_all_ddrs_to_singular() -> Dict[str, Any]:
+    """Sync all configured DDRs to their Singular timer fields."""
+    results = {}
+    errors = []
+
+    for ddr_key in CONFIG.tricaster_timer_fields.keys():
+        try:
+            ddr_num = int(ddr_key)
+            result = sync_ddr_to_singular(ddr_num)
+            results[f"ddr{ddr_num}"] = result
+        except Exception as e:
+            errors.append(f"DDR {ddr_key}: {str(e)}")
+
+    return {
+        "ok": len(errors) == 0,
+        "results": results,
+        "errors": errors if errors else None,
+    }
+
+
+def send_timer_command(ddr_num: int, command: str) -> Dict[str, Any]:
+    """Send a timer command (start, pause, reset) to Singular for a DDR."""
+    token = CONFIG.tricaster_singular_token
+    if not token:
+        raise HTTPException(400, "No Singular token configured for timer sync")
+
+    ddr_key = str(ddr_num)
+    fields = CONFIG.tricaster_timer_fields.get(ddr_key)
+    if not fields:
+        raise HTTPException(400, f"No timer fields configured for DDR {ddr_num}")
+
+    timer_field = fields.get("timer")
+    if not timer_field:
+        raise HTTPException(400, f"DDR {ddr_num} missing 'timer' field configuration")
+
+    # Send timer command
+    field_values = {
+        timer_field: {"command": command}
+    }
+    _patch_singular_fields(token, field_values)
+
+    return {"ok": True, "ddr": ddr_num, "command": command}
+
+
+def restart_timer(ddr_num: int) -> Dict[str, Any]:
+    """Restart a timer: pause -> reset (no auto-start)."""
+    send_timer_command(ddr_num, "pause")
+    time.sleep(0.05)  # Small delay between commands
+    send_timer_command(ddr_num, "reset")
+    return {"ok": True, "ddr": ddr_num, "action": "restart (paused/reset)"}
 
 
 def send_to_datastream(payload: Dict[str, Any]):
@@ -753,6 +1142,248 @@ def toggle_tfl_auto_refresh(cfg: ModuleToggleIn):
     CONFIG.tfl_auto_refresh = cfg.enabled
     save_config(CONFIG)
     return {"ok": True, "enabled": CONFIG.tfl_auto_refresh}
+
+
+# ================== TRICASTER MODULE ENDPOINTS ==================
+
+class TriCasterConfigIn(BaseModel):
+    host: Optional[str] = None
+    user: Optional[str] = None
+    password: Optional[str] = None
+
+
+@app.post("/config/module/tricaster")
+def toggle_tricaster_module(cfg: ModuleToggleIn):
+    CONFIG.enable_tricaster = cfg.enabled
+    save_config(CONFIG)
+    return {"ok": True, "enabled": CONFIG.enable_tricaster}
+
+
+@app.post("/config/tricaster")
+def save_tricaster_config(cfg: TriCasterConfigIn):
+    if cfg.host is not None:
+        CONFIG.tricaster_host = cfg.host if cfg.host else None
+    if cfg.user is not None:
+        CONFIG.tricaster_user = cfg.user or "admin"
+    if cfg.password is not None:
+        CONFIG.tricaster_pass = cfg.password if cfg.password else None
+    save_config(CONFIG)
+    return {"ok": True, "host": CONFIG.tricaster_host}
+
+
+@app.get("/tricaster/test")
+def tricaster_test():
+    """Test connection to TriCaster."""
+    return tricaster_test_connection()
+
+
+@app.get("/tricaster/ddr")
+def tricaster_ddr():
+    """Get DDR status from TriCaster."""
+    return tricaster_get_ddr_info()
+
+
+@app.get("/tricaster/tally")
+def tricaster_tally():
+    """Get tally status from TriCaster."""
+    return tricaster_get_tally()
+
+
+@app.get("/tricaster/dictionary/{key}")
+def tricaster_dictionary(key: str):
+    """Get raw dictionary data from TriCaster."""
+    return tricaster_get_dictionary(key)
+
+
+@app.post("/tricaster/shortcut/{name}")
+def tricaster_exec_shortcut(name: str, value: Optional[str] = None, index: Optional[int] = None):
+    """Execute a TriCaster shortcut command."""
+    params = {}
+    if value is not None:
+        params["value"] = str(value)
+    if index is not None:
+        params["index"] = str(index)
+    return tricaster_shortcut(name, params if params else None)
+
+
+@app.get("/tricaster/shortcut/{name}")
+def tricaster_exec_shortcut_get(name: str, value: Optional[str] = None, index: Optional[int] = None):
+    """Execute a TriCaster shortcut command (GET for easy triggering)."""
+    params = {}
+    if value is not None:
+        params["value"] = str(value)
+    if index is not None:
+        params["index"] = str(index)
+    return tricaster_shortcut(name, params if params else None)
+
+
+# Common TriCaster shortcuts as direct endpoints
+@app.get("/tricaster/record/start")
+def tricaster_record_start():
+    return tricaster_shortcut("record_start")
+
+
+@app.get("/tricaster/record/stop")
+def tricaster_record_stop():
+    return tricaster_shortcut("record_stop")
+
+
+@app.get("/tricaster/record/toggle")
+def tricaster_record_toggle():
+    return tricaster_shortcut("record_toggle")
+
+
+@app.get("/tricaster/streaming/start")
+def tricaster_streaming_start():
+    return tricaster_shortcut("streaming_start")
+
+
+@app.get("/tricaster/streaming/stop")
+def tricaster_streaming_stop():
+    return tricaster_shortcut("streaming_stop")
+
+
+@app.get("/tricaster/streaming/toggle")
+def tricaster_streaming_toggle():
+    return tricaster_shortcut("streaming_toggle")
+
+
+@app.get("/tricaster/main/auto")
+def tricaster_main_auto():
+    return tricaster_shortcut("main_auto")
+
+
+@app.get("/tricaster/main/take")
+def tricaster_main_take():
+    return tricaster_shortcut("main_take")
+
+
+@app.get("/tricaster/ddr/{ddr_num}/play")
+def tricaster_ddr_play(ddr_num: int):
+    return tricaster_shortcut(f"ddr{ddr_num}_play")
+
+
+@app.get("/tricaster/ddr/{ddr_num}/stop")
+def tricaster_ddr_stop(ddr_num: int):
+    return tricaster_shortcut(f"ddr{ddr_num}_stop")
+
+
+@app.get("/tricaster/macro/{macro_name}")
+def tricaster_macro_by_name(macro_name: str):
+    return tricaster_shortcut("play_macro_byname", {"value": macro_name})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DDR-to-Singular Timer Sync Endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TimerSyncConfigIn(BaseModel):
+    singular_token: Optional[str] = None
+    round_mode: str = "frames"
+    timer_fields: Dict[str, Dict[str, str]] = {}  # {"1": {"min": "...", "sec": "...", "timer": "..."}}
+
+
+@app.post("/config/tricaster/timer-sync")
+def save_timer_sync_config(cfg: TimerSyncConfigIn):
+    """Save DDR-to-Singular timer sync configuration."""
+    CONFIG.tricaster_singular_token = cfg.singular_token
+    CONFIG.tricaster_round_mode = cfg.round_mode
+    CONFIG.tricaster_timer_fields = cfg.timer_fields
+    save_config(CONFIG)
+    # Clear the field map cache when config changes
+    _singular_field_map_cache.clear()
+    return {"ok": True, "message": "Timer sync configuration saved"}
+
+
+@app.get("/config/tricaster/timer-sync")
+def get_timer_sync_config():
+    """Get current DDR-to-Singular timer sync configuration."""
+    return {
+        "singular_token": CONFIG.tricaster_singular_token,
+        "round_mode": CONFIG.tricaster_round_mode,
+        "timer_fields": CONFIG.tricaster_timer_fields,
+    }
+
+
+@app.get("/tricaster/sync/{ddr_num}")
+def sync_ddr_endpoint(ddr_num: int):
+    """Sync a single DDR's duration to its Singular timer fields."""
+    try:
+        return sync_ddr_to_singular(ddr_num)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("DDR sync failed: %s", e)
+        raise HTTPException(500, f"DDR sync failed: {str(e)}")
+
+
+@app.get("/tricaster/sync/all")
+def sync_all_ddrs_endpoint():
+    """Sync all configured DDRs to their Singular timer fields."""
+    try:
+        return sync_all_ddrs_to_singular()
+    except Exception as e:
+        logger.error("DDR sync all failed: %s", e)
+        raise HTTPException(500, f"DDR sync all failed: {str(e)}")
+
+
+@app.get("/tricaster/timer/{ddr_num}/start")
+def timer_start_endpoint(ddr_num: int):
+    """Start the Singular timer for a DDR."""
+    try:
+        return send_timer_command(ddr_num, "start")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Timer start failed: {str(e)}")
+
+
+@app.get("/tricaster/timer/{ddr_num}/pause")
+def timer_pause_endpoint(ddr_num: int):
+    """Pause the Singular timer for a DDR."""
+    try:
+        return send_timer_command(ddr_num, "pause")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Timer pause failed: {str(e)}")
+
+
+@app.get("/tricaster/timer/{ddr_num}/reset")
+def timer_reset_endpoint(ddr_num: int):
+    """Reset the Singular timer for a DDR."""
+    try:
+        return send_timer_command(ddr_num, "reset")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Timer reset failed: {str(e)}")
+
+
+@app.get("/tricaster/timer/{ddr_num}/restart")
+def timer_restart_endpoint(ddr_num: int):
+    """Restart the Singular timer for a DDR (pause + reset, no auto-start)."""
+    try:
+        return restart_timer(ddr_num)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Timer restart failed: {str(e)}")
+
+
+@app.get("/tricaster/timer/all/restart")
+def timer_restart_all_endpoint():
+    """Restart all configured Singular timers."""
+    results = []
+    errors = []
+    for ddr_key in CONFIG.tricaster_timer_fields.keys():
+        try:
+            ddr_num = int(ddr_key)
+            result = restart_timer(ddr_num)
+            results.append(result)
+        except Exception as e:
+            errors.append(f"DDR {ddr_key}: {str(e)}")
+    return {"ok": len(errors) == 0, "results": results, "errors": errors if errors else None}
 
 
 @app.get("/settings/json")
@@ -1473,10 +2104,102 @@ def modules_page():
     parts.append('</div>')  # Close tfl-content
     parts.append('</fieldset>')  # Close TfL fieldset
 
-    # Future modules placeholder
-    parts.append('<fieldset style="opacity: 0.6;"><legend>More Modules Coming Soon</legend>')
-    parts.append('<p style="color: #8b949e;">Additional modules will be available in future updates.</p>')
-    parts.append('</fieldset>')
+    # TriCaster Module
+    tricaster_enabled = "checked" if CONFIG.enable_tricaster else ""
+    tricaster_host = html_escape(CONFIG.tricaster_host or "")
+    tricaster_user = html_escape(CONFIG.tricaster_user or "admin")
+    tricaster_display = "block" if CONFIG.enable_tricaster else "none"
+
+    parts.append('<fieldset class="module-card"><legend>TriCaster Control</legend>')
+    parts.append('<div class="module-header">')
+    parts.append('<p class="module-title">NewTek/Vizrt TriCaster Integration</p>')
+    parts.append('<label class="toggle-switch"><input type="checkbox" id="tricaster-enabled" ' + tricaster_enabled + ' onchange="toggleTriCasterModule()" /><span class="toggle-slider"></span></label>')
+    parts.append('</div>')
+    parts.append('<p style="color: #8b949e; margin: 0;">Connect to TriCaster on your network to control recording, streaming, DDR, and more.</p>')
+
+    # TriCaster content container
+    parts.append(f'<div id="tricaster-content" style="display: {tricaster_display};">')
+
+    # Connection settings
+    parts.append('<form id="tricaster-form" style="margin-top: 16px;">')
+    parts.append('<div style="display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 12px;">')
+    parts.append('<div><label>TriCaster IP/Hostname<input name="tricaster_host" value="' + tricaster_host + '" placeholder="192.168.1.100 or tricaster.local" autocomplete="off" /></label></div>')
+    parts.append('<div><label>Username<input name="tricaster_user" value="' + tricaster_user + '" placeholder="admin" autocomplete="off" /></label></div>')
+    parts.append('<div><label>Password<input name="tricaster_pass" type="password" placeholder="(optional)" autocomplete="off" /></label></div>')
+    parts.append('</div>')
+    parts.append('</form>')
+
+    # Action buttons
+    parts.append('<div class="btn-row" style="margin-top: 16px;">')
+    parts.append('<button type="button" onclick="saveTriCasterConfig()">Save Connection</button>')
+    parts.append('<button type="button" class="secondary" onclick="testTriCasterConnection()">Test Connection</button>')
+    parts.append('<span id="tricaster-status" class="status idle">Not connected</span>')
+    parts.append('</div>')
+
+    # DDR-to-Singular Timer Sync Section
+    parts.append('<div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #3d3d3d;">')
+    parts.append('<h3 style="margin: 0 0 8px 0; font-size: 16px; font-weight: 600;">DDR-to-Singular Timer Sync</h3>')
+    parts.append('<p style="color: #888; margin: 0 0 16px 0; font-size: 13px;">Sync DDR durations to Singular timer controls. Configure field IDs from your Singular composition.</p>')
+
+    # Singular Token for Timer Sync
+    timer_token = CONFIG.tricaster_singular_token or ""
+    round_mode = CONFIG.tricaster_round_mode or "frames"
+    parts.append('<div style="display: grid; grid-template-columns: 2fr 1fr; gap: 12px; margin-bottom: 16px;">')
+    parts.append(f'<div><label>Singular Control App Token<input id="timer-sync-token" value="{timer_token}" placeholder="Control App token for timer fields" /></label></div>')
+    parts.append(f'<div><label>Round Mode<select id="timer-round-mode"><option value="frames" {"selected" if round_mode == "frames" else ""}>Round to Frames</option><option value="none" {"selected" if round_mode != "frames" else ""}>No Rounding</option></select></label></div>')
+    parts.append('</div>')
+
+    # DDR Field Mappings - 4 DDRs
+    parts.append('<div style="margin-bottom: 16px;">')
+    parts.append('<label style="font-size: 13px; color: #888; margin-bottom: 8px; display: block;">DDR Field Mappings (leave empty to skip a DDR)</label>')
+    parts.append('<div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px;">')
+    for ddr_num in range(1, 5):
+        ddr_key = str(ddr_num)
+        fields = CONFIG.tricaster_timer_fields.get(ddr_key, {})
+        min_val = fields.get("min", "")
+        sec_val = fields.get("sec", "")
+        timer_val = fields.get("timer", "")
+        parts.append(f'<div style="background: #252525; padding: 12px; border-radius: 8px;">')
+        parts.append(f'<div style="font-weight: 600; margin-bottom: 8px;">DDR {ddr_num}</div>')
+        parts.append(f'<div style="display: grid; gap: 6px;">')
+        parts.append(f'<input id="ddr{ddr_num}-min" value="{min_val}" placeholder="Minutes Field ID" style="font-size: 12px; padding: 6px 10px;" />')
+        parts.append(f'<input id="ddr{ddr_num}-sec" value="{sec_val}" placeholder="Seconds Field ID" style="font-size: 12px; padding: 6px 10px;" />')
+        parts.append(f'<input id="ddr{ddr_num}-timer" value="{timer_val}" placeholder="Timer Field ID (for start/stop)" style="font-size: 12px; padding: 6px 10px;" />')
+        parts.append('</div>')
+        parts.append('</div>')
+    parts.append('</div>')
+    parts.append('</div>')
+
+    # Save and Sync buttons
+    parts.append('<div class="btn-row">')
+    parts.append('<button type="button" onclick="saveTimerSyncConfig()">Save Config</button>')
+    parts.append('<button type="button" class="secondary" onclick="syncAllDDRs()">Sync All DDRs</button>')
+    parts.append('<span id="timer-sync-status" class="status idle">Not synced</span>')
+    parts.append('</div>')
+
+    # Individual DDR Sync controls
+    parts.append('<div style="margin-top: 16px;">')
+    parts.append('<label style="font-size: 13px; color: #888; margin-bottom: 8px; display: block;">Individual DDR Controls</label>')
+    parts.append('<div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;">')
+    for ddr_num in range(1, 5):
+        parts.append(f'<div style="background: #252525; padding: 8px; border-radius: 6px; text-align: center;">')
+        parts.append(f'<div style="font-size: 12px; font-weight: 600; margin-bottom: 6px;">DDR {ddr_num}</div>')
+        parts.append(f'<div style="display: flex; flex-direction: column; gap: 4px;">')
+        parts.append(f'<button type="button" class="secondary" style="padding: 4px 8px; font-size: 11px;" onclick="syncDDR({ddr_num})">Sync Duration</button>')
+        parts.append(f'<div style="display: flex; gap: 2px;">')
+        parts.append(f'<button type="button" class="success" style="flex: 1; padding: 4px; font-size: 10px;" onclick="timerCmd({ddr_num}, \'start\')">Start</button>')
+        parts.append(f'<button type="button" class="warning" style="flex: 1; padding: 4px; font-size: 10px;" onclick="timerCmd({ddr_num}, \'pause\')">Pause</button>')
+        parts.append(f'<button type="button" class="danger" style="flex: 1; padding: 4px; font-size: 10px;" onclick="timerCmd({ddr_num}, \'restart\')">Reset</button>')
+        parts.append('</div>')
+        parts.append('</div>')
+        parts.append('</div>')
+    parts.append('</div>')
+    parts.append('</div>')
+
+    parts.append('</div>')  # Close timer sync section
+
+    parts.append('</div>')  # Close tricaster-content
+    parts.append('</fieldset>')  # Close TriCaster fieldset
 
     # JavaScript - use a list and join with newlines
     js_lines = [
@@ -1663,6 +2386,143 @@ def modules_page():
         "  });",
         '  document.getElementById("manual-status").textContent = "Reset";',
         '  document.getElementById("manual-status").className = "status idle";',
+        "}",
+        "",
+        "// TriCaster Module Functions",
+        "async function toggleTriCasterModule() {",
+        '  const enabled = document.getElementById("tricaster-enabled").checked;',
+        '  const content = document.getElementById("tricaster-content");',
+        '  await postJSON("/config/module/tricaster", { enabled });',
+        '  content.style.display = enabled ? "block" : "none";',
+        "}",
+        "",
+        "async function saveTriCasterConfig() {",
+        '  const status = document.getElementById("tricaster-status");',
+        '  status.textContent = "Saving...";',
+        '  status.className = "status idle";',
+        "  try {",
+        '    const host = document.querySelector("[name=tricaster_host]").value;',
+        '    const user = document.querySelector("[name=tricaster_user]").value;',
+        '    const pass = document.querySelector("[name=tricaster_pass]").value;',
+        '    await postJSON("/config/tricaster", { host, user, password: pass });',
+        '    status.textContent = "Saved";',
+        '    status.className = "status success";',
+        "  } catch (e) {",
+        '    status.textContent = "Save failed: " + e.message;',
+        '    status.className = "status error";',
+        "  }",
+        "}",
+        "",
+        "async function testTriCasterConnection() {",
+        '  const status = document.getElementById("tricaster-status");',
+        '  status.textContent = "Testing...";',
+        '  status.className = "status idle";',
+        "  try {",
+        "    // Save config first",
+        "    await saveTriCasterConfig();",
+        '    const res = await fetch("/tricaster/test");',
+        "    const data = await res.json();",
+        "    if (data.ok) {",
+        '      status.textContent = "Connected to " + data.host;',
+        '      status.className = "status success";',
+        "      refreshDDRStatus();",
+        "    } else {",
+        '      status.textContent = data.error || "Connection failed";',
+        '      status.className = "status error";',
+        "    }",
+        "  } catch (e) {",
+        '    status.textContent = "Error: " + e.message;',
+        '    status.className = "status error";',
+        "  }",
+        "}",
+        "",
+        "// DDR-to-Singular Timer Sync Functions",
+        "async function saveTimerSyncConfig() {",
+        '  const token = document.getElementById("timer-sync-token").value.trim();',
+        '  const roundMode = document.getElementById("timer-round-mode").value;',
+        "  const timerFields = {};",
+        "  for (let i = 1; i <= 4; i++) {",
+        '    const min = document.getElementById("ddr" + i + "-min").value.trim();',
+        '    const sec = document.getElementById("ddr" + i + "-sec").value.trim();',
+        '    const timer = document.getElementById("ddr" + i + "-timer").value.trim();',
+        "    if (min || sec || timer) {",
+        '      timerFields[i.toString()] = { min: min, sec: sec, timer: timer };',
+        "    }",
+        "  }",
+        "  try {",
+        '    const res = await postJSON("/config/tricaster/timer-sync", {',
+        "      singular_token: token,",
+        "      round_mode: roundMode,",
+        "      timer_fields: timerFields",
+        "    });",
+        '    const status = document.getElementById("timer-sync-status");',
+        "    if (res.ok) {",
+        '      status.textContent = "Config saved";',
+        '      status.className = "status success";',
+        "    } else {",
+        '      status.textContent = res.error || "Save failed";',
+        '      status.className = "status error";',
+        "    }",
+        "  } catch (e) {",
+        '    alert("Error saving config: " + e.message);',
+        "  }",
+        "}",
+        "",
+        "async function syncAllDDRs() {",
+        '  const status = document.getElementById("timer-sync-status");',
+        '  status.textContent = "Syncing...";',
+        '  status.className = "status idle";',
+        "  try {",
+        '    const res = await fetch("/tricaster/sync/all");',
+        "    const data = await res.json();",
+        "    if (data.ok) {",
+        "      let synced = Object.keys(data.results || {}).length;",
+        '      status.textContent = "Synced " + synced + " DDRs";',
+        '      status.className = "status success";',
+        "    } else {",
+        '      status.textContent = (data.errors && data.errors[0]) || "Sync failed";',
+        '      status.className = "status error";',
+        "    }",
+        "  } catch (e) {",
+        '    status.textContent = "Error: " + e.message;',
+        '    status.className = "status error";',
+        "  }",
+        "}",
+        "",
+        "async function syncDDR(num) {",
+        '  const status = document.getElementById("timer-sync-status");',
+        "  try {",
+        '    const res = await fetch("/tricaster/sync/" + num);',
+        "    const data = await res.json();",
+        "    if (data.ok) {",
+        '      status.textContent = "DDR " + num + ": " + data.minutes + "m " + data.seconds.toFixed(2) + "s";',
+        '      status.className = "status success";',
+        "    } else {",
+        '      status.textContent = data.detail || data.error || "Sync failed";',
+        '      status.className = "status error";',
+        "    }",
+        "  } catch (e) {",
+        '    status.textContent = "Error: " + e.message;',
+        '    status.className = "status error";',
+        "  }",
+        "}",
+        "",
+        "async function timerCmd(num, cmd) {",
+        '  const status = document.getElementById("timer-sync-status");',
+        "  try {",
+        '    const res = await fetch("/tricaster/timer/" + num + "/" + cmd);',
+        "    const data = await res.json();",
+        "    if (data.ok) {",
+        '      status.textContent = "DDR " + num + " timer: " + cmd;',
+        '      status.className = "status success";',
+        "    } else {",
+        '      status.textContent = data.detail || data.error || "Command failed";',
+        '      status.className = "status error";',
+        "    }",
+        "  } catch (e) {",
+        '    status.textContent = "Error: " + e.message;',
+        '    status.className = "status error";',
+        "  }",
         "}",
     ]
     parts.append("\n".join(js_lines))
