@@ -5,6 +5,7 @@ import re
 import json
 import logging
 import traceback
+import asyncio
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import quote
@@ -201,6 +202,9 @@ class AppConfig(BaseModel):
     tricaster_singular_token: Optional[str] = None  # Control App token for timer sync
     tricaster_timer_fields: Dict[str, Dict[str, str]] = {}  # DDR mappings: {"1": {"min": "field_id", "sec": "field_id", "timer": "field_id"}}
     tricaster_round_mode: str = "frames"  # "frames" or "none" - whether to round to frame boundaries
+    # Auto-sync settings
+    tricaster_auto_sync: bool = False  # Enable automatic DDR duration syncing
+    tricaster_auto_sync_interval: int = 3  # Seconds between sync checks (2-10)
     theme: str = "dark"
     port: Optional[int] = None
 
@@ -223,6 +227,9 @@ def load_config() -> AppConfig:
         "tricaster_singular_token": os.getenv("TRICASTER_SINGULAR_TOKEN") or None,
         "tricaster_timer_fields": {},
         "tricaster_round_mode": os.getenv("TRICASTER_ROUND_MODE", "frames"),
+        # Auto-sync defaults
+        "tricaster_auto_sync": False,
+        "tricaster_auto_sync_interval": 3,
         "theme": "dark",
         "port": int(os.getenv("SINGULAR_TWEAKS_PORT")) if os.getenv("SINGULAR_TWEAKS_PORT") else None,
     }
@@ -867,6 +874,87 @@ def coerce_value(field_meta: Dict[str, Any], value_str: str, as_string: bool = F
     return value_str
 
 
+# ================== AUTO-SYNC STATE ==================
+_auto_sync_task: Optional[asyncio.Task] = None
+_auto_sync_running: bool = False
+_last_ddr_values: Dict[str, Tuple[int, float]] = {}  # DDR num -> (minutes, seconds)
+_last_auto_sync_time: Optional[str] = None
+_auto_sync_error: Optional[str] = None
+
+
+async def _auto_sync_loop():
+    """Background task that polls TriCaster and syncs changed DDR durations to Singular."""
+    global _auto_sync_running, _last_ddr_values, _last_auto_sync_time, _auto_sync_error
+    _auto_sync_running = True
+    _auto_sync_error = None
+    logger.info("[AUTO-SYNC] Started with interval %ds", CONFIG.tricaster_auto_sync_interval)
+
+    while _auto_sync_running and CONFIG.tricaster_auto_sync:
+        try:
+            # Only sync if we have the required config
+            if not CONFIG.tricaster_host or not CONFIG.tricaster_singular_token:
+                await asyncio.sleep(CONFIG.tricaster_auto_sync_interval)
+                continue
+
+            # Get current DDR durations from TriCaster
+            for ddr_num_str, fields in CONFIG.tricaster_timer_fields.items():
+                if not fields.get("min") or not fields.get("sec"):
+                    continue  # Skip DDRs without field mappings
+
+                try:
+                    ddr_num = int(ddr_num_str)
+                    duration, fps = _get_ddr_duration_and_fps(ddr_num)
+                    if duration is None:
+                        continue
+
+                    mins, secs = _split_minutes_seconds(duration, fps)
+                    current_val = (mins, round(secs, 2))  # Round for comparison
+
+                    # Only sync if value changed
+                    if _last_ddr_values.get(ddr_num_str) != current_val:
+                        _last_ddr_values[ddr_num_str] = current_val
+                        # Sync to Singular using existing function
+                        sync_ddr_to_singular(ddr_num)
+                        _last_auto_sync_time = datetime.now().strftime("%H:%M:%S")
+                        logger.info("[AUTO-SYNC] DDR %d synced: %dm %.2fs", ddr_num, mins, secs)
+
+                except HTTPException as e:
+                    logger.debug("[AUTO-SYNC] DDR %s: %s", ddr_num_str, e.detail)
+                except Exception as e:
+                    logger.debug("[AUTO-SYNC] DDR %s error: %s", ddr_num_str, e)
+
+            _auto_sync_error = None
+
+        except Exception as e:
+            _auto_sync_error = str(e)
+            logger.warning("[AUTO-SYNC] Error: %s", e)
+
+        await asyncio.sleep(CONFIG.tricaster_auto_sync_interval)
+
+    _auto_sync_running = False
+    logger.info("[AUTO-SYNC] Stopped")
+
+
+def start_auto_sync():
+    """Start the auto-sync background task."""
+    global _auto_sync_task, _auto_sync_running
+    if _auto_sync_running:
+        return  # Already running
+
+    _auto_sync_running = True
+    loop = asyncio.get_event_loop()
+    _auto_sync_task = loop.create_task(_auto_sync_loop())
+
+
+def stop_auto_sync():
+    """Stop the auto-sync background task."""
+    global _auto_sync_running, _auto_sync_task
+    _auto_sync_running = False
+    if _auto_sync_task:
+        _auto_sync_task.cancel()
+        _auto_sync_task = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
@@ -874,7 +962,15 @@ async def lifespan(app: FastAPI):
             build_registry()
     except Exception as e:
         logger.warning("[WARN] Registry build failed: %s", e)
+
+    # Start auto-sync if enabled in config
+    if CONFIG.tricaster_auto_sync:
+        asyncio.create_task(_auto_sync_loop())
+
     yield
+
+    # Stop auto-sync on shutdown
+    stop_auto_sync()
 
 app.router.lifespan_context = lifespan
 
@@ -1305,16 +1401,39 @@ def get_timer_sync_config():
     }
 
 
-@app.get("/tricaster/sync/{ddr_num}")
-def sync_ddr_endpoint(ddr_num: int):
-    """Sync a single DDR's duration to its Singular timer fields."""
-    try:
-        return sync_ddr_to_singular(ddr_num)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("DDR sync failed: %s", e)
-        raise HTTPException(500, f"DDR sync failed: {str(e)}")
+@app.get("/api/singular/apps")
+def get_singular_apps():
+    """Get list of configured Singular apps (name → token)."""
+    return {"apps": CONFIG.singular_tokens}
+
+
+@app.get("/api/singular/fields/{app_name}")
+def get_singular_fields(app_name: str):
+    """Get all field IDs for a given Singular app."""
+    if app_name not in REGISTRY:
+        # Try to build registry if not yet built
+        if app_name in CONFIG.singular_tokens:
+            build_registry_for_app(app_name, CONFIG.singular_tokens[app_name])
+
+    if app_name not in REGISTRY:
+        raise HTTPException(404, f"App '{app_name}' not found")
+
+    fields = []
+    for key, sub in REGISTRY[app_name].items():
+        sub_name = sub.get("name", key)
+        for field_id, field_meta in sub.get("fields", {}).items():
+            if field_id:  # Skip empty field IDs
+                field_name = field_meta.get("title") or field_meta.get("name") or field_id
+                fields.append({
+                    "id": field_id,
+                    "name": field_name,
+                    "subcomposition": sub_name,
+                    "type": field_meta.get("type", "unknown")
+                })
+
+    # Sort by subcomposition then field name
+    fields.sort(key=lambda f: (f["subcomposition"], f["name"]))
+    return {"fields": fields, "count": len(fields)}
 
 
 @app.get("/tricaster/sync/all")
@@ -1325,6 +1444,18 @@ def sync_all_ddrs_endpoint():
     except Exception as e:
         logger.error("DDR sync all failed: %s", e)
         raise HTTPException(500, f"DDR sync all failed: {str(e)}")
+
+
+@app.get("/tricaster/sync/{ddr_num}")
+def sync_ddr_endpoint(ddr_num: int):
+    """Sync a single DDR's duration to its Singular timer fields."""
+    try:
+        return sync_ddr_to_singular(ddr_num)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("DDR sync failed: %s", e)
+        raise HTTPException(500, f"DDR sync failed: {str(e)}")
 
 
 @app.get("/tricaster/timer/{ddr_num}/start")
@@ -1384,6 +1515,59 @@ def timer_restart_all_endpoint():
         except Exception as e:
             errors.append(f"DDR {ddr_key}: {str(e)}")
     return {"ok": len(errors) == 0, "results": results, "errors": errors if errors else None}
+
+
+# ================== AUTO-SYNC ENDPOINTS ==================
+
+class AutoSyncConfigIn(BaseModel):
+    enabled: bool
+    interval: Optional[int] = None  # 2-10 seconds
+
+
+@app.get("/tricaster/auto-sync/status")
+def get_auto_sync_status():
+    """Get current auto-sync status and configuration."""
+    return {
+        "enabled": CONFIG.tricaster_auto_sync,
+        "running": _auto_sync_running,
+        "interval": CONFIG.tricaster_auto_sync_interval,
+        "last_sync": _last_auto_sync_time,
+        "error": _auto_sync_error,
+        "cached_values": {k: {"minutes": v[0], "seconds": v[1]} for k, v in _last_ddr_values.items()},
+    }
+
+
+@app.post("/tricaster/auto-sync")
+async def set_auto_sync(config: AutoSyncConfigIn):
+    """Enable or disable auto-sync and configure interval."""
+    global _auto_sync_running
+
+    # Update interval if provided (clamp to 2-10 seconds)
+    if config.interval is not None:
+        CONFIG.tricaster_auto_sync_interval = max(2, min(10, config.interval))
+
+    # Update enabled state
+    CONFIG.tricaster_auto_sync = config.enabled
+    save_config(CONFIG)
+
+    if config.enabled and not _auto_sync_running:
+        # Start auto-sync
+        asyncio.create_task(_auto_sync_loop())
+        return {
+            "ok": True,
+            "message": "Auto-sync started",
+            "interval": CONFIG.tricaster_auto_sync_interval,
+        }
+    elif not config.enabled and _auto_sync_running:
+        # Stop auto-sync
+        stop_auto_sync()
+        return {"ok": True, "message": "Auto-sync stopped"}
+    else:
+        return {
+            "ok": True,
+            "message": "Auto-sync " + ("enabled" if config.enabled else "disabled"),
+            "interval": CONFIG.tricaster_auto_sync_interval,
+        }
 
 
 @app.get("/settings/json")
@@ -2005,6 +2189,9 @@ def modules_page():
     parts.append("  .tfl-label span { font-size: 11px; font-weight: 600; text-align: center; line-height: 1.2; }")
     parts.append("  input.tfl-input { flex: 1 !important; padding: 12px 14px !important; font-size: 12px !important; background: #0c6473; color: #fff !important; border: none !important; font-weight: 500 !important; outline: none !important; font-family: inherit !important; width: auto !important; margin: 0 !important; border-radius: 0 !important; }")
     parts.append("  input.tfl-input::placeholder { color: rgba(255,255,255,0.5) !important; }")
+    # HTTP Command URL styles
+    parts.append("  .cmd-url { display: block; padding: 8px 12px; background: #2d2d2d; border-radius: 4px; font-family: 'Consolas', 'Monaco', monospace; font-size: 11px; color: #4ecdc4; cursor: pointer; transition: all 0.2s; word-break: break-all; }")
+    parts.append("  .cmd-url:hover { background: #3d3d3d; color: #fff; }")
     parts.append("</style>")
     parts.append("</head><body>")
     # Disconnect overlay
@@ -2138,20 +2325,30 @@ def modules_page():
 
     # DDR-to-Singular Timer Sync Section
     parts.append('<div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #3d3d3d;">')
-    parts.append('<h3 style="margin: 0 0 8px 0; font-size: 16px; font-weight: 600;">DDR-to-Singular Timer Sync</h3>')
-    parts.append('<p style="color: #888; margin: 0 0 16px 0; font-size: 13px;">Sync DDR durations to Singular timer controls. Configure field IDs from your Singular composition.</p>')
+    parts.append('<h3 style="margin: 0 0 8px 0; font-size: 16px; font-weight: 600;">DDR to Singular Timer Sync</h3>')
+    parts.append('<p style="color: #888; margin: 0 0 16px 0; font-size: 13px;">Sync DDR durations to Singular timer controls. Select a Control App and configure field mappings.</p>')
 
-    # Singular Token for Timer Sync
+    # Singular App dropdown and Round Mode
     timer_token = CONFIG.tricaster_singular_token or ""
     round_mode = CONFIG.tricaster_round_mode or "frames"
     parts.append('<div style="display: grid; grid-template-columns: 2fr 1fr; gap: 12px; margin-bottom: 16px;">')
-    parts.append(f'<div><label>Singular Control App Token<input id="timer-sync-token" value="{timer_token}" placeholder="Control App token for timer fields" /></label></div>')
+    # Build app dropdown from saved tokens
+    parts.append('<div><label>Singular Control App')
+    parts.append('<select id="timer-sync-app" onchange="onTimerAppChange()">')
+    parts.append('<option value="">-- Select Control App --</option>')
+    for app_name, token in CONFIG.singular_tokens.items():
+        selected = "selected" if token == timer_token else ""
+        parts.append(f'<option value="{app_name}" {selected}>{app_name}</option>')
+    parts.append('</select>')
+    parts.append('</label></div>')
     parts.append(f'<div><label>Round Mode<select id="timer-round-mode"><option value="frames" {"selected" if round_mode == "frames" else ""}>Round to Frames</option><option value="none" {"selected" if round_mode != "frames" else ""}>No Rounding</option></select></label></div>')
     parts.append('</div>')
 
-    # DDR Field Mappings - 4 DDRs
+    # DDR Field Mappings - 4 DDRs with searchable dropdowns
     parts.append('<div style="margin-bottom: 16px;">')
-    parts.append('<label style="font-size: 13px; color: #888; margin-bottom: 8px; display: block;">DDR Field Mappings (leave empty to skip a DDR)</label>')
+    parts.append('<label style="font-size: 13px; color: #888; margin-bottom: 8px; display: block;">DDR Field Mappings (start typing to search fields)</label>')
+    # Hidden datalist populated by JavaScript when app is selected
+    parts.append('<datalist id="singular-fields-list"></datalist>')
     parts.append('<div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px;">')
     for ddr_num in range(1, 5):
         ddr_key = str(ddr_num)
@@ -2160,11 +2357,14 @@ def modules_page():
         sec_val = fields.get("sec", "")
         timer_val = fields.get("timer", "")
         parts.append(f'<div style="background: #252525; padding: 12px; border-radius: 8px;">')
-        parts.append(f'<div style="font-weight: 600; margin-bottom: 8px;">DDR {ddr_num}</div>')
+        parts.append(f'<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">')
+        parts.append(f'<span style="font-weight: 600;">DDR {ddr_num}</span>')
+        parts.append(f'<span id="ddr{ddr_num}-duration" style="font-size: 11px; color: #888;">--:--</span>')
+        parts.append('</div>')
         parts.append(f'<div style="display: grid; gap: 6px;">')
-        parts.append(f'<input id="ddr{ddr_num}-min" value="{min_val}" placeholder="Minutes Field ID" style="font-size: 12px; padding: 6px 10px;" />')
-        parts.append(f'<input id="ddr{ddr_num}-sec" value="{sec_val}" placeholder="Seconds Field ID" style="font-size: 12px; padding: 6px 10px;" />')
-        parts.append(f'<input id="ddr{ddr_num}-timer" value="{timer_val}" placeholder="Timer Field ID (for start/stop)" style="font-size: 12px; padding: 6px 10px;" />')
+        parts.append(f'<input id="ddr{ddr_num}-min" list="singular-fields-list" value="{min_val}" placeholder="Minutes Field ID (type to search)" style="font-size: 12px; padding: 6px 10px;" />')
+        parts.append(f'<input id="ddr{ddr_num}-sec" list="singular-fields-list" value="{sec_val}" placeholder="Seconds Field ID (type to search)" style="font-size: 12px; padding: 6px 10px;" />')
+        parts.append(f'<input id="ddr{ddr_num}-timer" list="singular-fields-list" value="{timer_val}" placeholder="Timer Field ID (type to search)" style="font-size: 12px; padding: 6px 10px;" />')
         parts.append('</div>')
         parts.append('</div>')
     parts.append('</div>')
@@ -2175,6 +2375,30 @@ def modules_page():
     parts.append('<button type="button" onclick="saveTimerSyncConfig()">Save Config</button>')
     parts.append('<button type="button" class="secondary" onclick="syncAllDDRs()">Sync All DDRs</button>')
     parts.append('<span id="timer-sync-status" class="status idle">Not synced</span>')
+    parts.append('</div>')
+
+    # Auto-sync toggle and interval
+    auto_sync_enabled = "checked" if CONFIG.tricaster_auto_sync else ""
+    auto_sync_interval = CONFIG.tricaster_auto_sync_interval
+    parts.append('<div style="margin-top: 16px; padding: 12px; background: #1a1a1a; border-radius: 8px;">')
+    parts.append('<div style="display: flex; align-items: center; justify-content: space-between;">')
+    parts.append('<div style="display: flex; align-items: center; gap: 12px;">')
+    parts.append('<label class="toggle-switch"><input type="checkbox" id="auto-sync-enabled" ' + auto_sync_enabled + ' onchange="toggleAutoSync()" /><span class="toggle-slider"></span></label>')
+    parts.append('<div>')
+    parts.append('<span style="font-weight: 600; font-size: 14px;">Auto-Sync</span>')
+    parts.append('<p style="margin: 2px 0 0 0; font-size: 11px; color: #888;">Automatically sync DDR durations when clips change</p>')
+    parts.append('</div>')
+    parts.append('</div>')
+    parts.append('<div style="display: flex; align-items: center; gap: 8px;">')
+    parts.append('<label style="font-size: 12px; color: #888;">Interval:</label>')
+    parts.append(f'<select id="auto-sync-interval" onchange="updateAutoSyncInterval()" style="padding: 4px 8px; font-size: 12px; background: #252525; color: #fff; border: 1px solid #3d3d3d; border-radius: 4px;">')
+    for secs in [2, 3, 5, 10]:
+        selected = "selected" if secs == auto_sync_interval else ""
+        parts.append(f'<option value="{secs}" {selected}>{secs}s</option>')
+    parts.append('</select>')
+    parts.append('<span id="auto-sync-status" style="font-size: 11px; color: #888;">--</span>')
+    parts.append('</div>')
+    parts.append('</div>')
     parts.append('</div>')
 
     # Individual DDR Sync controls
@@ -2196,6 +2420,79 @@ def modules_page():
     parts.append('</div>')
     parts.append('</div>')
 
+    # HTTP Command URLs section - collapsible
+    parts.append('<div style="margin-top: 20px; padding-top: 16px; border-top: 1px solid #3d3d3d;">')
+    parts.append('<div onclick="toggleHttpCommands()" style="cursor: pointer; display: flex; align-items: center; gap: 8px;">')
+    parts.append('<span id="http-commands-arrow" style="transition: transform 0.2s;">&#9654;</span>')
+    parts.append('<h3 style="margin: 0; font-size: 14px; font-weight: 600;">HTTP Command URLs</h3>')
+    parts.append('</div>')
+    parts.append('<div id="http-commands-content" style="display: none; margin-top: 12px;">')
+    parts.append('<p style="color: #888; margin: 0 0 12px 0; font-size: 12px;">Click any URL to copy. Use these from TriCaster macros or external systems.</p>')
+    parts.append('<div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; font-size: 11px;">')
+
+    # Generate command URLs for each DDR
+    base_url = f"http://localhost:{effective_port()}"
+    for ddr_num in range(1, 5):
+        parts.append(f'<div style="background: #1a1a1a; padding: 10px; border-radius: 6px;">')
+        parts.append(f'<div style="font-weight: 600; margin-bottom: 6px; color: #4ecdc4;">DDR {ddr_num}</div>')
+        parts.append('<div style="display: flex; flex-direction: column; gap: 4px;">')
+
+        # Sync duration
+        sync_url = f"{base_url}/tricaster/sync/{ddr_num}"
+        parts.append(f'<div style="display: flex; justify-content: space-between; align-items: center;">')
+        parts.append(f'<span style="color: #888;">Sync:</span>')
+        parts.append(f'<code class="cmd-url" onclick="copyToClipboard(this)" title="Click to copy">{sync_url}</code>')
+        parts.append('</div>')
+
+        # Timer start
+        start_url = f"{base_url}/tricaster/timer/{ddr_num}/start"
+        parts.append(f'<div style="display: flex; justify-content: space-between; align-items: center;">')
+        parts.append(f'<span style="color: #888;">Start:</span>')
+        parts.append(f'<code class="cmd-url" onclick="copyToClipboard(this)" title="Click to copy">{start_url}</code>')
+        parts.append('</div>')
+
+        # Timer pause
+        pause_url = f"{base_url}/tricaster/timer/{ddr_num}/pause"
+        parts.append(f'<div style="display: flex; justify-content: space-between; align-items: center;">')
+        parts.append(f'<span style="color: #888;">Pause:</span>')
+        parts.append(f'<code class="cmd-url" onclick="copyToClipboard(this)" title="Click to copy">{pause_url}</code>')
+        parts.append('</div>')
+
+        # Timer restart (pause + reset)
+        restart_url = f"{base_url}/tricaster/timer/{ddr_num}/restart"
+        parts.append(f'<div style="display: flex; justify-content: space-between; align-items: center;">')
+        parts.append(f'<span style="color: #888;">Reset:</span>')
+        parts.append(f'<code class="cmd-url" onclick="copyToClipboard(this)" title="Click to copy">{restart_url}</code>')
+        parts.append('</div>')
+
+        parts.append('</div>')
+        parts.append('</div>')
+
+    parts.append('</div>')
+
+    # All DDRs commands
+    parts.append('<div style="margin-top: 8px; background: #1a1a1a; padding: 10px; border-radius: 6px;">')
+    parts.append('<div style="font-weight: 600; margin-bottom: 6px; color: #4ecdc4;">All DDRs</div>')
+    parts.append('<div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 4px; font-size: 11px;">')
+
+    sync_all_url = f"{base_url}/tricaster/sync/all"
+    parts.append(f'<div style="display: flex; justify-content: space-between; align-items: center;">')
+    parts.append(f'<span style="color: #888;">Sync All:</span>')
+    parts.append(f'<code class="cmd-url" onclick="copyToClipboard(this)" title="Click to copy">{sync_all_url}</code>')
+    parts.append('</div>')
+
+    restart_all_url = f"{base_url}/tricaster/timer/all/restart"
+    parts.append(f'<div style="display: flex; justify-content: space-between; align-items: center;">')
+    parts.append(f'<span style="color: #888;">Reset All:</span>')
+    parts.append(f'<code class="cmd-url" onclick="copyToClipboard(this)" title="Click to copy">{restart_all_url}</code>')
+    parts.append('</div>')
+
+    parts.append('</div>')
+    parts.append('</div>')
+
+    parts.append('</div>')  # Close http-commands-content
+    parts.append('</div>')  # Close HTTP commands section
+
     parts.append('</div>')  # Close timer sync section
 
     parts.append('</div>')  # Close tricaster-content
@@ -2213,6 +2510,27 @@ def modules_page():
         "    body: JSON.stringify(data),",
         "  });",
         "  return res.json();",
+        "}",
+        "",
+        "function copyToClipboard(el) {",
+        "  const text = el.textContent || el.innerText;",
+        "  navigator.clipboard.writeText(text).then(() => {",
+        "    const orig = el.style.background;",
+        '    el.style.background = "#4ecdc4";',
+        "    setTimeout(() => { el.style.background = orig; }, 300);",
+        "  });",
+        "}",
+        "",
+        "function toggleHttpCommands() {",
+        '  const content = document.getElementById("http-commands-content");',
+        '  const arrow = document.getElementById("http-commands-arrow");',
+        '  if (content.style.display === "none") {',
+        '    content.style.display = "block";',
+        '    arrow.style.transform = "rotate(90deg)";',
+        "  } else {",
+        '    content.style.display = "none";',
+        '    arrow.style.transform = "rotate(0deg)";',
+        "  }",
         "}",
         "",
         "async function toggleModule() {",
@@ -2280,7 +2598,7 @@ def modules_page():
         "    const data = await res.json();",
         '    preview.textContent = JSON.stringify(data, null, 2);',
         '    preview.style.display = "block";',
-        '    status.textContent = "Preview loaded (not sent)";',
+        '    status.textContent = "Preview loaded";',
         '    status.className = "status idle";',
         "  } catch (e) {",
         '    status.textContent = "Preview failed: " + e.message;',
@@ -2425,7 +2743,6 @@ def modules_page():
         "    if (data.ok) {",
         '      status.textContent = "Connected to " + data.host;',
         '      status.className = "status success";',
-        "      refreshDDRStatus();",
         "    } else {",
         '      status.textContent = data.error || "Connection failed";',
         '      status.className = "status error";',
@@ -2436,9 +2753,52 @@ def modules_page():
         "  }",
         "}",
         "",
+        "// Singular field cache for searchable dropdowns",
+        "let singularFieldsCache = [];",
+        "",
+        "async function onTimerAppChange() {",
+        '  const appSelect = document.getElementById("timer-sync-app");',
+        "  const appName = appSelect.value;",
+        "  if (!appName) {",
+        "    singularFieldsCache = [];",
+        '    document.getElementById("singular-fields-list").innerHTML = "";',
+        "    return;",
+        "  }",
+        "  try {",
+        '    const res = await fetch("/api/singular/fields/" + encodeURIComponent(appName));',
+        "    const data = await res.json();",
+        "    singularFieldsCache = data.fields || [];",
+        "    // Populate datalist",
+        '    const datalist = document.getElementById("singular-fields-list");',
+        '    datalist.innerHTML = singularFieldsCache.map(f => ',
+        "      `<option value=\"${f.id}\">${f.name} (${f.subcomposition})</option>`",
+        '    ).join("");',
+        "  } catch (e) {",
+        '    console.error("Failed to load fields:", e);',
+        "  }",
+        "}",
+        "",
+        "// Load fields on page load if app already selected",
+        "document.addEventListener('DOMContentLoaded', function() {",
+        '  const appSelect = document.getElementById("timer-sync-app");',
+        "  if (appSelect && appSelect.value) {",
+        "    onTimerAppChange();",
+        "  }",
+        "});",
+        "",
         "// DDR-to-Singular Timer Sync Functions",
         "async function saveTimerSyncConfig() {",
-        '  const token = document.getElementById("timer-sync-token").value.trim();',
+        '  const appSelect = document.getElementById("timer-sync-app");',
+        "  const appName = appSelect.value;",
+        "  // Get the actual token for the selected app",
+        '  const appOption = appSelect.options[appSelect.selectedIndex];',
+        "  let token = '';",
+        "  if (appName) {",
+        "    // Fetch the token from the apps endpoint",
+        '    const appsRes = await fetch("/api/singular/apps");',
+        "    const appsData = await appsRes.json();",
+        "    token = appsData.apps[appName] || '';",
+        "  }",
         '  const roundMode = document.getElementById("timer-round-mode").value;',
         "  const timerFields = {};",
         "  for (let i = 1; i <= 4; i++) {",
@@ -2468,6 +2828,12 @@ def modules_page():
         "  }",
         "}",
         "",
+        "function formatDuration(minutes, seconds) {",
+        "  const m = Math.floor(minutes);",
+        "  const s = seconds.toFixed(2);",
+        "  return m + ':' + (s < 10 ? '0' : '') + s;",
+        "}",
+        "",
         "async function syncAllDDRs() {",
         '  const status = document.getElementById("timer-sync-status");',
         '  status.textContent = "Syncing...";',
@@ -2476,7 +2842,17 @@ def modules_page():
         '    const res = await fetch("/tricaster/sync/all");',
         "    const data = await res.json();",
         "    if (data.ok) {",
-        "      let synced = Object.keys(data.results || {}).length;",
+        "      let synced = 0;",
+        "      // Update duration displays for each DDR",
+        "      for (const [key, result] of Object.entries(data.results || {})) {",
+        "        const ddrNum = key.replace('ddr', '');",
+        '        const durEl = document.getElementById("ddr" + ddrNum + "-duration");',
+        "        if (durEl && result.ok) {",
+        "          durEl.textContent = formatDuration(result.minutes, result.seconds);",
+        '          durEl.style.color = "#4ecdc4";',
+        "          synced++;",
+        "        }",
+        "      }",
         '      status.textContent = "Synced " + synced + " DDRs";',
         '      status.className = "status success";',
         "    } else {",
@@ -2491,17 +2867,31 @@ def modules_page():
         "",
         "async function syncDDR(num) {",
         '  const status = document.getElementById("timer-sync-status");',
+        '  const durEl = document.getElementById("ddr" + num + "-duration");',
         "  try {",
         '    const res = await fetch("/tricaster/sync/" + num);',
         "    const data = await res.json();",
         "    if (data.ok) {",
-        '      status.textContent = "DDR " + num + ": " + data.minutes + "m " + data.seconds.toFixed(2) + "s";',
+        "      const durText = formatDuration(data.minutes, data.seconds);",
+        "      if (durEl) {",
+        "        durEl.textContent = durText;",
+        '        durEl.style.color = "#4ecdc4";',
+        "      }",
+        '      status.textContent = "DDR " + num + ": " + durText;',
         '      status.className = "status success";',
         "    } else {",
+        "      if (durEl) {",
+        '        durEl.textContent = "Error";',
+        '        durEl.style.color = "#e74c3c";',
+        "      }",
         '      status.textContent = data.detail || data.error || "Sync failed";',
         '      status.className = "status error";',
         "    }",
         "  } catch (e) {",
+        "    if (durEl) {",
+        '      durEl.textContent = "Error";',
+        '      durEl.style.color = "#e74c3c";',
+        "    }",
         '    status.textContent = "Error: " + e.message;',
         '    status.className = "status error";',
         "  }",
@@ -2524,6 +2914,85 @@ def modules_page():
         '    status.className = "status error";',
         "  }",
         "}",
+        "",
+        "// Auto-sync functions",
+        "let autoSyncStatusInterval = null;",
+        "",
+        "async function toggleAutoSync() {",
+        '  const enabled = document.getElementById("auto-sync-enabled").checked;',
+        '  const interval = parseInt(document.getElementById("auto-sync-interval").value);',
+        "  try {",
+        '    const res = await postJSON("/tricaster/auto-sync", { enabled: enabled, interval: interval });',
+        "    if (res.ok) {",
+        "      if (enabled) {",
+        "        startAutoSyncStatusPolling();",
+        "      } else {",
+        "        stopAutoSyncStatusPolling();",
+        '        document.getElementById("auto-sync-status").textContent = "--";',
+        "      }",
+        "    }",
+        "  } catch (e) {",
+        '    console.error("Auto-sync toggle failed:", e);',
+        "  }",
+        "}",
+        "",
+        "async function updateAutoSyncInterval() {",
+        '  const enabled = document.getElementById("auto-sync-enabled").checked;',
+        '  const interval = parseInt(document.getElementById("auto-sync-interval").value);',
+        "  try {",
+        '    await postJSON("/tricaster/auto-sync", { enabled: enabled, interval: interval });',
+        "  } catch (e) {",
+        '    console.error("Auto-sync interval update failed:", e);',
+        "  }",
+        "}",
+        "",
+        "async function pollAutoSyncStatus() {",
+        "  try {",
+        '    const res = await fetch("/tricaster/auto-sync/status");',
+        "    const data = await res.json();",
+        '    const statusEl = document.getElementById("auto-sync-status");',
+        "    if (data.running) {",
+        '      statusEl.textContent = data.last_sync ? "Last: " + data.last_sync : "Running...";',
+        '      statusEl.style.color = "#4ecdc4";',
+        "      // Update DDR duration displays from cached values",
+        "      for (const [ddr, vals] of Object.entries(data.cached_values || {})) {",
+        '        const durEl = document.getElementById("ddr" + ddr + "-duration");',
+        "        if (durEl) {",
+        "          durEl.textContent = formatDuration(vals.minutes, vals.seconds);",
+        '          durEl.style.color = "#4ecdc4";',
+        "        }",
+        "      }",
+        "    } else if (data.error) {",
+        '      statusEl.textContent = "Error";',
+        '      statusEl.style.color = "#e74c3c";',
+        "    } else {",
+        '      statusEl.textContent = "--";',
+        '      statusEl.style.color = "#888";',
+        "    }",
+        "  } catch (e) {",
+        '    console.error("Auto-sync status poll failed:", e);',
+        "  }",
+        "}",
+        "",
+        "function startAutoSyncStatusPolling() {",
+        "  if (autoSyncStatusInterval) return;",
+        "  pollAutoSyncStatus();",
+        "  autoSyncStatusInterval = setInterval(pollAutoSyncStatus, 2000);",
+        "}",
+        "",
+        "function stopAutoSyncStatusPolling() {",
+        "  if (autoSyncStatusInterval) {",
+        "    clearInterval(autoSyncStatusInterval);",
+        "    autoSyncStatusInterval = null;",
+        "  }",
+        "}",
+        "",
+        "// Start polling if auto-sync is enabled on page load",
+        "document.addEventListener('DOMContentLoaded', function() {",
+        '  if (document.getElementById("auto-sync-enabled") && document.getElementById("auto-sync-enabled").checked) {',
+        "    startAutoSyncStatusPolling();",
+        "  }",
+        "});",
     ]
     parts.append("\n".join(js_lines))
 
