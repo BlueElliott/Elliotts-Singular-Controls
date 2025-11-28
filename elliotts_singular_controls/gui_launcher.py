@@ -8,12 +8,12 @@ import threading
 import webbrowser
 import logging
 import tkinter as tk
-from tkinter import scrolledtext, messagebox
+from tkinter import scrolledtext, messagebox, font as tkfont
 from pathlib import Path
 import socket
 import psutil
 import pystray
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from io import StringIO
 
 # Set Windows app ID for taskbar icon (must be done before tkinter)
@@ -49,6 +49,18 @@ def kill_process_on_port(port: int) -> bool:
     return killed
 
 
+def get_local_ip() -> str:
+    """Get the local network IP address."""
+    try:
+        # Create a socket to determine local IP
+        # This doesn't actually connect, just determines routing
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+
+
 class SingularTweaksGUI:
     def __init__(self):
         self.root = tk.Tk()
@@ -72,6 +84,9 @@ class SingularTweaksGUI:
         self.button_red_dark = "#c0392b"  # Darker red for quit
 
         self.root.configure(bg=self.bg_dark)
+
+        # Load ITV Reem fonts
+        self._load_fonts()
 
         # Icon for system tray
         self.icon = None
@@ -107,6 +122,46 @@ class SingularTweaksGUI:
                     self.root.iconbitmap(str(icon_path))
         except Exception as e:
             pass  # Icon not critical
+
+    def _load_fonts(self):
+        """Load ITV Reem fonts for the GUI."""
+        try:
+            # Get font paths
+            from elliotts_singular_controls.core import _app_root
+            static_path = _app_root() / "static"
+
+            # Try to load ITV Reem fonts
+            regular_path = static_path / "ITV Reem-Regular.ttf"
+            medium_path = static_path / "ITV Reem-Medium.ttf"
+            bold_path = static_path / "ITV Reem-Bold.ttf"
+
+            # Create font objects with fallback to system fonts
+            if regular_path.exists():
+                self.font_regular = ("ITV Reem", 10)
+                self.font_regular_11 = ("ITV Reem", 11)
+                self.font_regular_24 = ("ITV Reem", 24)
+                self.font_regular_32 = ("ITV Reem", 32)
+            else:
+                self.font_regular = ("Segoe UI", 10)
+                self.font_regular_11 = ("Segoe UI", 11)
+                self.font_regular_24 = ("Segoe UI", 24)
+                self.font_regular_32 = ("Segoe UI", 32)
+
+            self.font_bold = ("ITV Reem", 10, "bold") if regular_path.exists() else ("Segoe UI", 10, "bold")
+            self.font_bold_11 = ("ITV Reem", 11, "bold") if regular_path.exists() else ("Segoe UI", 11, "bold")
+            self.font_bold_24 = ("ITV Reem", 24, "bold") if regular_path.exists() else ("Segoe UI", 24, "bold")
+            self.font_bold_32 = ("ITV Reem", 32, "bold") if regular_path.exists() else ("Segoe UI", 32, "bold")
+
+        except Exception as e:
+            # Fallback to system fonts
+            self.font_regular = ("Segoe UI", 10)
+            self.font_regular_11 = ("Segoe UI", 11)
+            self.font_regular_24 = ("Segoe UI", 24)
+            self.font_regular_32 = ("Segoe UI", 32)
+            self.font_bold = ("Segoe UI", 10, "bold")
+            self.font_bold_11 = ("Segoe UI", 11, "bold")
+            self.font_bold_24 = ("Segoe UI", 24, "bold")
+            self.font_bold_32 = ("Segoe UI", 32, "bold")
 
     def create_icon_image(self):
         """Create ESC icon for the system tray matching the new logo design."""
@@ -188,7 +243,7 @@ class SingularTweaksGUI:
             width/2, height/2,
             text=text,
             fill=self.text_light if state == tk.NORMAL else self.text_gray,
-            font=("Arial", 11, "bold")
+            font=self.font_bold_11
         )
 
         # Bind click event
@@ -228,7 +283,7 @@ class SingularTweaksGUI:
         brand_label = tk.Label(
             brand_frame,
             text="Elliott's Singular Controls",
-            font=("Arial", 24, "bold"),
+            font=self.font_bold_24,
             bg=self.bg_dark,
             fg=self.text_light
         )
@@ -237,7 +292,7 @@ class SingularTweaksGUI:
         version_label = tk.Label(
             brand_frame,
             text=f"Version {_runtime_version()}",
-            font=("Arial", 10),
+            font=self.font_regular,
             bg=self.bg_dark,
             fg=self.text_gray
         )
@@ -261,15 +316,15 @@ class SingularTweaksGUI:
         self._draw_rounded_rect(port_card_canvas, 0, 0, 670, 140, 20, self.bg_card)
 
         # SERVER PORT label
-        port_card_canvas.create_text(335, 25, text="SERVER PORT", fill=self.text_gray, font=("Arial", 10, "bold"))
+        port_card_canvas.create_text(335, 25, text="SERVER PORT", fill=self.text_gray, font=self.font_bold)
 
         # Port number with teal background (rounded)
         self._draw_rounded_rect(port_card_canvas, 235, 40, 435, 95, 12, self.accent_teal)
-        self.port_text_id = port_card_canvas.create_text(335, 67, text=str(effective_port()), fill=self.text_light, font=("Arial", 32, "bold"))
+        self.port_text_id = port_card_canvas.create_text(335, 67, text=str(effective_port()), fill=self.text_light, font=self.font_bold_32)
 
         # Change port button (small, rounded)
         self._draw_rounded_rect(port_card_canvas, 275, 105, 395, 132, 14, self.bg_medium)
-        port_card_canvas.create_text(335, 118, text="Change Port", fill=self.text_gray, font=("Arial", 9))
+        port_card_canvas.create_text(335, 118, text="Change Port", fill=self.text_gray, font=("ITV Reem", 9))
 
         # Bind click on change port area
         port_card_canvas.tag_bind("change_port", "<Button-1>", lambda e: self.change_port())
@@ -279,6 +334,24 @@ class SingularTweaksGUI:
         port_card_canvas.bind("<Leave>", lambda e: port_card_canvas.configure(cursor=""))
 
         self.port_card_canvas = port_card_canvas
+
+        # Network IP display (clickable to copy)
+        network_ip = get_local_ip()
+        port = effective_port()
+        self.network_url = f"http://{network_ip}:{port}"
+
+        network_label = tk.Label(
+            content_frame,
+            text=f"Network: {self.network_url}",
+            font=("ITV Reem", 10),
+            bg=self.bg_dark,
+            fg=self.accent_teal,
+            cursor="hand2"
+        )
+        network_label.pack(pady=(0, 10))
+        network_label.bind("<Button-1>", lambda e: self.copy_network_url())
+        network_label.bind("<Enter>", lambda e: network_label.configure(fg="#fff"))
+        network_label.bind("<Leave>", lambda e: network_label.configure(fg=self.accent_teal))
 
         # Status frame with pulse indicator and runtime
         status_frame = tk.Frame(content_frame, bg=self.bg_dark)
@@ -295,7 +368,7 @@ class SingularTweaksGUI:
         self.status_label = tk.Label(
             status_frame,
             text="Starting server...",
-            font=("Arial", 11),
+            font=self.font_regular_11,
             bg=self.bg_dark,
             fg=self.text_gray
         )
@@ -305,7 +378,7 @@ class SingularTweaksGUI:
         self.runtime_label = tk.Label(
             status_frame,
             text="",
-            font=("Arial", 10),
+            font=self.font_regular,
             bg=self.bg_dark,
             fg=self.text_gray
         )
@@ -315,7 +388,7 @@ class SingularTweaksGUI:
         self.url_label = tk.Label(
             content_frame,
             text=f"http://127.0.0.1:{effective_port()}/",
-            font=("Arial", 10),
+            font=self.font_regular,
             bg=self.bg_dark,
             fg=self.text_gray
         )
@@ -554,11 +627,12 @@ class SingularTweaksGUI:
 
             # Add initial status message
             port = effective_port()
+            local_ip = get_local_ip()
             self.console_text.insert(tk.END, f"Elliott's Singular Controls v{_runtime_version()}\n")
             self.console_text.insert(tk.END, "=" * 60 + "\n")
             if self.server_running:
                 self.console_text.insert(tk.END, f"✓ Server running on http://0.0.0.0:{port}\n")
-                self.console_text.insert(tk.END, f"  Access at: http://localhost:{port}\n")
+                self.console_text.insert(tk.END, f"  Network: http://{local_ip}:{port}\n")
             else:
                 self.console_text.insert(tk.END, "⚠ Server not running\n")
             self.console_text.insert(tk.END, "=" * 60 + "\n\n")
@@ -617,7 +691,7 @@ class SingularTweaksGUI:
         width = int(canvas['width'])
         height = int(canvas['height'])
         self._draw_smooth_rounded_rect(canvas, 0, 0, width, height, 10, bg_color)
-        canvas.create_text(width/2, height/2, text=text, fill=self.text_light, font=("Arial", 11, "bold"))
+        canvas.create_text(width/2, height/2, text=text, fill=self.text_light, font=self.font_bold_11)
 
     def start_server(self):
         """Start the server in a background thread."""
@@ -693,7 +767,7 @@ class SingularTweaksGUI:
         width = int(canvas['width'])
         height = int(canvas['height'])
         self._draw_smooth_rounded_rect(canvas, 0, 0, width, height, 10, bg_color)
-        canvas.create_text(width/2, height/2, text="Open Web GUI", fill=self.text_light, font=("Arial", 11, "bold"))
+        canvas.create_text(width/2, height/2, text="Open Web GUI", fill=self.text_light, font=self.font_bold_11)
         canvas.bind("<Button-1>", lambda e: self.launch_browser())
         canvas.bind("<Enter>", lambda e: canvas.configure(cursor="hand2"))
         canvas.bind("<Leave>", lambda e: canvas.configure(cursor=""))
@@ -764,6 +838,19 @@ class SingularTweaksGUI:
         """Open the web GUI in default browser."""
         port = effective_port()
         webbrowser.open(f"http://localhost:{port}")
+
+    def copy_network_url(self):
+        """Copy network URL to clipboard."""
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self.network_url)
+            self.root.update()  # Required for clipboard to persist
+            # Brief visual feedback
+            original_text = self.status_label.cget("text")
+            self.status_label.config(text=f"✓ Copied: {self.network_url}")
+            self.root.after(2000, lambda: self.status_label.config(text=original_text))
+        except Exception as e:
+            print(f"Failed to copy to clipboard: {e}")
 
     def minimize_to_tray(self):
         """Minimize window to system tray."""

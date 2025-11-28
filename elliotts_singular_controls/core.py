@@ -13,7 +13,7 @@ from html import escape as html_escape
 from datetime import datetime
 
 import requests
-from fastapi import FastAPI, Query, HTTPException, Request
+from fastapi import FastAPI, Query, HTTPException, Request, Body
 from fastapi.responses import HTMLResponse
 from fastapi.routing import APIRoute
 from fastapi.staticfiles import StaticFiles
@@ -205,6 +205,14 @@ class AppConfig(BaseModel):
     # Auto-sync settings
     tricaster_auto_sync: bool = False  # Enable automatic DDR duration syncing
     tricaster_auto_sync_interval: int = 3  # Seconds between sync checks (2-10)
+    # Cuez Automator module settings
+    enable_cuez: bool = False
+    cuez_host: str = "localhost"
+    cuez_port: Optional[int] = None  # No default - user must enter their port
+    cuez_cached_buttons: List[Dict[str, Any]] = []  # Cached button list
+    cuez_cached_macros: List[Dict[str, Any]] = []  # Cached macro list
+    # iNews Cleaner module settings
+    enable_inews: bool = False
     theme: str = "dark"
     port: Optional[int] = None
 
@@ -230,6 +238,10 @@ def load_config() -> AppConfig:
         # Auto-sync defaults
         "tricaster_auto_sync": False,
         "tricaster_auto_sync_interval": 3,
+        # Cuez defaults
+        "enable_cuez": False,
+        "cuez_host": os.getenv("CUEZ_HOST", "localhost"),
+        "cuez_port": int(os.getenv("CUEZ_PORT", "7070")),
         "theme": "dark",
         "port": int(os.getenv("SINGULAR_TWEAKS_PORT")) if os.getenv("SINGULAR_TWEAKS_PORT") else None,
     }
@@ -752,6 +764,209 @@ def _base_url(request: Request) -> str:
     return f"{proto}://{host}"
 
 
+# ================== CUEZ API HELPERS ==================
+
+def _cuez_base_url() -> str:
+    """Get the base URL for Cuez API."""
+    # If port is None, 0, or 80, omit it from URL (standard HTTP)
+    if CONFIG.cuez_port is None or CONFIG.cuez_port in (0, 80):
+        return f"http://{CONFIG.cuez_host}"
+    return f"http://{CONFIG.cuez_host}:{CONFIG.cuez_port}"
+
+
+def cuez_request(endpoint: str, method: str = "GET", json_data: dict = None) -> requests.Response:
+    """Make a request to the Cuez API."""
+    if not CONFIG.enable_cuez:
+        raise HTTPException(400, "Cuez module is disabled")
+
+    url = f"{_cuez_base_url()}{endpoint}"
+
+    try:
+        if method == "GET":
+            resp = requests.get(url, timeout=5)
+        elif method == "POST":
+            resp = requests.post(url, json=json_data, timeout=5)
+        elif method == "PUT":
+            resp = requests.put(url, json=json_data, timeout=5)
+        else:
+            resp = requests.request(method, url, json=json_data, timeout=5)
+        resp.raise_for_status()
+        return resp
+    except requests.RequestException as e:
+        logger.error("Cuez request failed: %s", e)
+        raise HTTPException(503, f"Cuez request failed: {str(e)}")
+
+
+def cuez_test_connection() -> Dict[str, Any]:
+    """Test connection to Cuez Automator."""
+    if not CONFIG.cuez_host:
+        return {"ok": False, "error": "No Cuez host configured"}
+
+    base_url = _cuez_base_url()
+    test_url = f"{base_url}/api/app/webconnection"
+    try:
+        # Use the official API connection check endpoint
+        resp = requests.get(test_url, timeout=5)
+        resp.raise_for_status()
+        if resp.status_code == 200:
+            return {"ok": True, "host": CONFIG.cuez_host, "port": CONFIG.cuez_port, "url": base_url}
+        return {"ok": False, "error": f"Unexpected status: {resp.status_code}"}
+    except requests.RequestException as e:
+        return {"ok": False, "error": str(e), "url": test_url}
+
+
+def cuez_get_buttons() -> Dict[str, Any]:
+    """Get list of all buttons from Cuez."""
+    try:
+        resp = cuez_request("/api/trigger/button/")
+        buttons = resp.json()
+        # Cache the buttons
+        CONFIG.cuez_cached_buttons = buttons
+        save_config(CONFIG)
+        return {"ok": True, "buttons": buttons}
+    except HTTPException as e:
+        return {"ok": False, "error": e.detail}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def cuez_fire_button(button_id: str) -> Dict[str, Any]:
+    """Fire/click a specific button by ID."""
+    try:
+        resp = cuez_request(f"/api/trigger/button/{button_id}/click")
+        return {"ok": True, "button_id": button_id, "action": "clicked"}
+    except HTTPException as e:
+        return {"ok": False, "error": e.detail}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def cuez_set_button_state(button_id: str, state: str) -> Dict[str, Any]:
+    """Set button state to ON or OFF."""
+    if state.upper() not in ("ON", "OFF"):
+        return {"ok": False, "error": "State must be ON or OFF"}
+    try:
+        resp = cuez_request(f"/api/trigger/button/{button_id}/{state.lower()}")
+        return {"ok": True, "button_id": button_id, "state": state.upper()}
+    except HTTPException as e:
+        return {"ok": False, "error": e.detail}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def cuez_get_macros() -> Dict[str, Any]:
+    """Get list of all macros from Cuez."""
+    try:
+        resp = cuez_request("/api/macro/")
+        macros = resp.json()
+        # Cache the macros
+        CONFIG.cuez_cached_macros = macros
+        save_config(CONFIG)
+        return {"ok": True, "macros": macros}
+    except HTTPException as e:
+        return {"ok": False, "error": e.detail}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def cuez_run_macro(macro_id: str) -> Dict[str, Any]:
+    """Fire a macro by ID."""
+    try:
+        resp = cuez_request(f"/api/macro/{macro_id}")
+        return {"ok": True, "macro_id": macro_id, "action": "fired"}
+    except HTTPException as e:
+        return {"ok": False, "error": e.detail}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def cuez_navigation(action: str) -> Dict[str, Any]:
+    """Execute a navigation action: next, previous, nextTrigger, previousTrigger, firstTrigger."""
+    valid_actions = {
+        "next": "/api/trigger/next",
+        "previous": "/api/trigger/previous",
+        "next-trigger": "/api/trigger/nextTrigger",
+        "previous-trigger": "/api/trigger/previousTrigger",
+        "first-trigger": "/api/trigger/firstTrigger",
+    }
+    if action not in valid_actions:
+        return {"ok": False, "error": f"Invalid action. Valid: {list(valid_actions.keys())}"}
+    try:
+        resp = cuez_request(valid_actions[action])
+        return {"ok": True, "action": action}
+    except HTTPException as e:
+        return {"ok": False, "error": e.detail}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def cuez_get_items() -> Dict[str, Any]:
+    """Get all items in the current rundown."""
+    try:
+        resp = cuez_request("/api/episode/items")
+        return {"ok": True, "items": resp.json()}
+    except HTTPException as e:
+        return {"ok": False, "error": e.detail}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def cuez_get_blocks() -> Dict[str, Any]:
+    """Get all blocks (triggers) in the current rundown."""
+    try:
+        resp = cuez_request("/api/trigger/blockcontent")
+        return {"ok": True, "blocks": resp.json()}
+    except HTTPException as e:
+        return {"ok": False, "error": e.detail}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def cuez_get_current() -> Dict[str, Any]:
+    """Get the currently triggered item."""
+    try:
+        resp = cuez_request("/api/trigger/current")
+        return {"ok": True, "current": resp.json()}
+    except HTTPException as e:
+        return {"ok": False, "error": e.detail}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def cuez_trigger_block(block_id: str) -> Dict[str, Any]:
+    """Trigger a specific block by ID."""
+    try:
+        resp = cuez_request(f"/api/trigger/block/{block_id}")
+        return {"ok": True, "block_id": block_id, "action": "triggered"}
+    except HTTPException as e:
+        return {"ok": False, "error": e.detail}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ================== iNews CLEANER HELPER ==================
+
+def inews_clean_text(raw_text: str) -> str:
+    """
+    Clean iNews text by removing formatting grommet lines.
+
+    iNews exports include special formatting lines like:
+    ¤W0 16 ]] C2.5 G 0 [[
+
+    This function removes those lines and returns clean text.
+    """
+    # Pattern for grommet lines like: ¤W0 16 ]] C2.5 G 0 [[
+    pattern = r"^¤W\d+\s+\d+\s+\]\].*?\[\[\s*$"
+
+    cleaned_lines = []
+    for line in raw_text.splitlines():
+        # Keep lines that don't match the grommet pattern
+        if not re.match(pattern, line.strip()):
+            cleaned_lines.append(line)
+
+    return "\n".join(cleaned_lines)
+
+
 # ================== 3. REGISTRY (Control App model) ==================
 
 # REGISTRY structure: {app_name: {key: {id, name, fields, app_name, token}}}
@@ -887,7 +1102,7 @@ async def _auto_sync_loop():
     global _auto_sync_running, _last_ddr_values, _last_auto_sync_time, _auto_sync_error
     _auto_sync_running = True
     _auto_sync_error = None
-    logger.info("[AUTO-SYNC] Started with interval %ds", CONFIG.tricaster_auto_sync_interval)
+    logger.debug("[AUTO-SYNC] Started with interval %ds", CONFIG.tricaster_auto_sync_interval)
 
     while _auto_sync_running and CONFIG.tricaster_auto_sync:
         try:
@@ -916,7 +1131,7 @@ async def _auto_sync_loop():
                         # Sync to Singular using existing function
                         sync_ddr_to_singular(ddr_num)
                         _last_auto_sync_time = datetime.now().strftime("%H:%M:%S")
-                        logger.info("[AUTO-SYNC] DDR %d synced: %dm %.2fs", ddr_num, mins, secs)
+                        logger.debug("[AUTO-SYNC] DDR %d synced: %dm %.2fs", ddr_num, mins, secs)
 
                 except HTTPException as e:
                     logger.debug("[AUTO-SYNC] DDR %s: %s", ddr_num_str, e.detail)
@@ -932,7 +1147,7 @@ async def _auto_sync_loop():
         await asyncio.sleep(CONFIG.tricaster_auto_sync_interval)
 
     _auto_sync_running = False
-    logger.info("[AUTO-SYNC] Stopped")
+    logger.debug("[AUTO-SYNC] Stopped")
 
 
 def start_auto_sync():
@@ -1023,11 +1238,54 @@ def _base_style() -> str:
     lines.append('<link rel="icon" type="image/x-icon" href="/static/favicon.ico">')
     lines.append('<link rel="icon" type="image/png" href="/static/esc_icon.png">')
     lines.append("<style>")
+    # ITV Reem font family - all weights
+    lines.append("  @font-face {")
+    lines.append("    font-family: 'ITVReem';")
+    lines.append("    src: url('/static/ITV Reem-Light.ttf') format('truetype');")
+    lines.append("    font-weight: 300;")
+    lines.append("    font-style: normal;")
+    lines.append("  }")
+    lines.append("  @font-face {")
+    lines.append("    font-family: 'ITVReem';")
+    lines.append("    src: url('/static/ITV Reem-LightItalic.ttf') format('truetype');")
+    lines.append("    font-weight: 300;")
+    lines.append("    font-style: italic;")
+    lines.append("  }")
     lines.append("  @font-face {")
     lines.append("    font-family: 'ITVReem';")
     lines.append("    src: url('/static/ITV Reem-Regular.ttf') format('truetype');")
-    lines.append("    font-weight: normal;")
+    lines.append("    font-weight: 400;")
     lines.append("    font-style: normal;")
+    lines.append("  }")
+    lines.append("  @font-face {")
+    lines.append("    font-family: 'ITVReem';")
+    lines.append("    src: url('/static/ITV Reem-Italic.ttf') format('truetype');")
+    lines.append("    font-weight: 400;")
+    lines.append("    font-style: italic;")
+    lines.append("  }")
+    lines.append("  @font-face {")
+    lines.append("    font-family: 'ITVReem';")
+    lines.append("    src: url('/static/ITV Reem-Medium.ttf') format('truetype');")
+    lines.append("    font-weight: 500;")
+    lines.append("    font-style: normal;")
+    lines.append("  }")
+    lines.append("  @font-face {")
+    lines.append("    font-family: 'ITVReem';")
+    lines.append("    src: url('/static/ITV Reem-MediumItalic.ttf') format('truetype');")
+    lines.append("    font-weight: 500;")
+    lines.append("    font-style: italic;")
+    lines.append("  }")
+    lines.append("  @font-face {")
+    lines.append("    font-family: 'ITVReem';")
+    lines.append("    src: url('/static/ITV Reem-Bold.ttf') format('truetype');")
+    lines.append("    font-weight: 700;")
+    lines.append("    font-style: normal;")
+    lines.append("  }")
+    lines.append("  @font-face {")
+    lines.append("    font-family: 'ITVReem';")
+    lines.append("    src: url('/static/ITV Reem-BoldItalic.ttf') format('truetype');")
+    lines.append("    font-weight: 700;")
+    lines.append("    font-style: italic;")
     lines.append("  }")
     lines.append("  * { box-sizing: border-box; }")
     lines.append(
@@ -1542,6 +1800,8 @@ async def set_auto_sync(config: AutoSyncConfigIn):
     """Enable or disable auto-sync and configure interval."""
     global _auto_sync_running
 
+    old_interval = CONFIG.tricaster_auto_sync_interval
+
     # Update interval if provided (clamp to 2-10 seconds)
     if config.interval is not None:
         CONFIG.tricaster_auto_sync_interval = max(2, min(10, config.interval))
@@ -1550,12 +1810,24 @@ async def set_auto_sync(config: AutoSyncConfigIn):
     CONFIG.tricaster_auto_sync = config.enabled
     save_config(CONFIG)
 
+    # If interval changed while running, restart the loop to pick up new interval
+    interval_changed = old_interval != CONFIG.tricaster_auto_sync_interval
+
     if config.enabled and not _auto_sync_running:
         # Start auto-sync
         asyncio.create_task(_auto_sync_loop())
         return {
             "ok": True,
             "message": "Auto-sync started",
+            "interval": CONFIG.tricaster_auto_sync_interval,
+        }
+    elif config.enabled and _auto_sync_running and interval_changed:
+        # Restart to pick up new interval
+        stop_auto_sync()
+        asyncio.create_task(_auto_sync_loop())
+        return {
+            "ok": True,
+            "message": f"Auto-sync restarted with {CONFIG.tricaster_auto_sync_interval}s interval",
             "interval": CONFIG.tricaster_auto_sync_interval,
         }
     elif not config.enabled and _auto_sync_running:
@@ -1568,6 +1840,184 @@ async def set_auto_sync(config: AutoSyncConfigIn):
             "message": "Auto-sync " + ("enabled" if config.enabled else "disabled"),
             "interval": CONFIG.tricaster_auto_sync_interval,
         }
+
+
+# ================== CUEZ MODULE ENDPOINTS ==================
+
+class CuezConfigData(BaseModel):
+    host: str
+    port: int
+
+
+class CuezModuleToggle(BaseModel):
+    enabled: bool
+
+
+@app.post("/config/module/cuez")
+def toggle_cuez_module(data: CuezModuleToggle):
+    """Enable or disable the Cuez module."""
+    CONFIG.enable_cuez = data.enabled
+    save_config(CONFIG)
+    return {"ok": True, "enable_cuez": CONFIG.enable_cuez}
+
+
+@app.post("/config/cuez")
+def save_cuez_config(config: CuezConfigData):
+    """Save Cuez connection settings."""
+    CONFIG.cuez_host = config.host
+    CONFIG.cuez_port = config.port
+    save_config(CONFIG)
+    return {"ok": True, "host": CONFIG.cuez_host, "port": CONFIG.cuez_port}
+
+
+@app.get("/cuez/test")
+def test_cuez():
+    """Test connection to Cuez Automator."""
+    return cuez_test_connection()
+
+
+@app.get("/cuez/buttons")
+def get_cuez_buttons():
+    """Get list of all buttons from Cuez."""
+    return cuez_get_buttons()
+
+
+@app.post("/cuez/buttons/{button_id}/fire")
+def fire_cuez_button(button_id: str):
+    """Fire a specific button."""
+    return cuez_fire_button(button_id)
+
+
+@app.post("/cuez/buttons/{button_id}/on")
+def set_cuez_button_on(button_id: str):
+    """Set button to ON state."""
+    return cuez_set_button_state(button_id, "ON")
+
+
+@app.post("/cuez/buttons/{button_id}/off")
+def set_cuez_button_off(button_id: str):
+    """Set button to OFF state."""
+    return cuez_set_button_state(button_id, "OFF")
+
+
+@app.get("/cuez/macros")
+def get_cuez_macros():
+    """Get list of all macros from Cuez."""
+    return cuez_get_macros()
+
+
+@app.post("/cuez/macros/{macro_id}/run")
+def run_cuez_macro(macro_id: str):
+    """Run a specific macro."""
+    return cuez_run_macro(macro_id)
+
+
+@app.post("/cuez/next")
+def cuez_next():
+    """Navigate to next item."""
+    return cuez_navigation("next")
+
+
+@app.post("/cuez/previous")
+def cuez_previous():
+    """Navigate to previous item."""
+    return cuez_navigation("previous")
+
+
+@app.post("/cuez/next-trigger")
+def cuez_next_trigger():
+    """Navigate to next trigger."""
+    return cuez_navigation("next-trigger")
+
+
+@app.post("/cuez/previous-trigger")
+def cuez_previous_trigger():
+    """Navigate to previous trigger."""
+    return cuez_navigation("previous-trigger")
+
+
+@app.post("/cuez/first-trigger")
+def cuez_first_trigger():
+    """Navigate to first trigger."""
+    return cuez_navigation("first-trigger")
+
+
+# GET versions of navigation for easy URL triggering
+@app.get("/cuez/nav/next")
+def cuez_nav_next():
+    """Navigate to next item (GET version for URL triggering)."""
+    return cuez_navigation("next")
+
+
+@app.get("/cuez/nav/previous")
+def cuez_nav_previous():
+    """Navigate to previous item (GET version for URL triggering)."""
+    return cuez_navigation("previous")
+
+
+@app.get("/cuez/nav/next-trigger")
+def cuez_nav_next_trigger():
+    """Navigate to next trigger (GET version for URL triggering)."""
+    return cuez_navigation("next-trigger")
+
+
+@app.get("/cuez/nav/previous-trigger")
+def cuez_nav_previous_trigger():
+    """Navigate to previous trigger (GET version for URL triggering)."""
+    return cuez_navigation("previous-trigger")
+
+
+@app.get("/cuez/nav/first-trigger")
+def cuez_nav_first_trigger():
+    """Navigate to first trigger (GET version for URL triggering)."""
+    return cuez_navigation("first-trigger")
+
+
+@app.get("/cuez/items")
+def cuez_items_endpoint():
+    """Get all items in the current rundown."""
+    return cuez_get_items()
+
+
+@app.get("/cuez/blocks")
+def cuez_blocks_endpoint():
+    """Get all blocks in the current rundown."""
+    return cuez_get_blocks()
+
+
+@app.get("/cuez/current")
+def cuez_current_endpoint():
+    """Get the currently triggered item."""
+    return cuez_get_current()
+
+
+@app.get("/cuez/trigger/{block_id}")
+def cuez_trigger_block_endpoint(block_id: str):
+    """Trigger a specific block by ID."""
+    return cuez_trigger_block(block_id)
+
+
+# ================== iNews CLEANER ENDPOINTS ==================
+
+@app.post("/config/module/inews")
+def set_inews_module(req: Request, body: dict = Body(...)):
+    """Enable or disable the iNews Cleaner module."""
+    enabled = body.get("enabled", False)
+    CONFIG.enable_inews = enabled
+    save_config(CONFIG)
+    return {"ok": True, "enabled": CONFIG.enable_inews}
+
+
+@app.post("/inews/clean")
+def inews_clean_endpoint(body: dict = Body(...)):
+    """Clean iNews text by removing formatting grommets."""
+    raw_text = body.get("text", "")
+    try:
+        cleaned = inews_clean_text(raw_text)
+        return {"ok": True, "cleaned": cleaned}
+    except Exception as e:
+        logger.error("iNews cleaning failed: %s", e)
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/settings/json")
@@ -2157,7 +2607,8 @@ def index():
 
 
 @app.get("/modules", response_class=HTMLResponse)
-def modules_page():
+def modules_page(request: Request):
+    base_url = _base_url(request)
     parts: List[str] = []
     parts.append("<!DOCTYPE html>")
     parts.append("<html><head>")
@@ -2430,8 +2881,7 @@ def modules_page():
     parts.append('<p style="color: #888; margin: 0 0 12px 0; font-size: 12px;">Click any URL to copy. Use these from TriCaster macros or external systems.</p>')
     parts.append('<div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; font-size: 11px;">')
 
-    # Generate command URLs for each DDR
-    base_url = f"http://localhost:{effective_port()}"
+    # Generate command URLs for each DDR (using dynamic base URL)
     for ddr_num in range(1, 5):
         parts.append(f'<div style="background: #1a1a1a; padding: 10px; border-radius: 6px;">')
         parts.append(f'<div style="font-weight: 600; margin-bottom: 6px; color: #4ecdc4;">DDR {ddr_num}</div>')
@@ -2497,6 +2947,154 @@ def modules_page():
 
     parts.append('</div>')  # Close tricaster-content
     parts.append('</fieldset>')  # Close TriCaster fieldset
+
+    # Cuez Automator Module
+    cuez_enabled = "checked" if CONFIG.enable_cuez else ""
+    cuez_host = html_escape(CONFIG.cuez_host or "localhost")
+    cuez_port = CONFIG.cuez_port if CONFIG.cuez_port else ""  # Empty if not set
+    cuez_display = "block" if CONFIG.enable_cuez else "none"
+
+    parts.append('<fieldset class="module-card"><legend>Cuez Automator</legend>')
+    parts.append('<div class="module-header">')
+    parts.append('<p class="module-title">Cuez Automator Integration</p>')
+    parts.append('<label class="toggle-switch"><input type="checkbox" id="cuez-enabled" ' + cuez_enabled + ' onchange="toggleCuezModule()" /><span class="toggle-slider"></span></label>')
+    parts.append('</div>')
+    parts.append('<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">')
+    parts.append('<p style="color: #8b949e; margin: 0;">Connect to Cuez Automator for rundown navigation, button triggering, and macro execution.</p>')
+    parts.append('<a href="/cuez/control" target="_blank" style="display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; background: #3d3d3d; color: #fff; text-decoration: none; border-radius: 6px; font-size: 12px; font-weight: 500; transition: background 0.2s;">Open Standalone <span style="font-size: 10px;">↗</span></a>')
+    parts.append('</div>')
+
+    # Cuez content container
+    parts.append(f'<div id="cuez-content" style="display: {cuez_display};">')
+
+    # Connection settings
+    parts.append('<form id="cuez-form" style="margin-top: 16px;">')
+    parts.append('<div style="display: grid; grid-template-columns: 2fr 1fr; gap: 12px;">')
+    parts.append(f'<div><label>Cuez Host<input name="cuez_host" value="{cuez_host}" placeholder="localhost" autocomplete="off" /></label></div>')
+    parts.append(f'<div><label>Port<input name="cuez_port" type="number" value="{cuez_port}" placeholder="7070" autocomplete="off" /></label></div>')
+    parts.append('</div>')
+    parts.append('</form>')
+
+    # Connection buttons
+    parts.append('<div class="btn-row" style="margin-top: 16px;">')
+    parts.append('<button type="button" onclick="saveCuezConfig()">Save Connection</button>')
+    parts.append('<button type="button" class="secondary" onclick="testCuezConnection()">Test Connection</button>')
+    parts.append('<span id="cuez-status" class="status idle">Not connected</span>')
+    parts.append('</div>')
+
+    # Navigation Controls
+    parts.append('<div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #3d3d3d;">')
+    parts.append('<h3 style="margin: 0 0 8px 0; font-size: 16px; font-weight: 600;">Navigation Controls</h3>')
+    parts.append('<p style="color: #888; margin: 0 0 16px 0; font-size: 13px;">Navigate through your Cuez rundown.</p>')
+    parts.append('<div class="btn-row">')
+    parts.append('<button type="button" onclick="cuezNav(\'previous\')">← Previous</button>')
+    parts.append('<button type="button" onclick="cuezNav(\'next\')">Next →</button>')
+    parts.append('<button type="button" class="secondary" onclick="cuezNav(\'first-trigger\')">First Trigger</button>')
+    parts.append('<button type="button" class="secondary" onclick="cuezNav(\'previous-trigger\')">← Prev Trigger</button>')
+    parts.append('<button type="button" class="secondary" onclick="cuezNav(\'next-trigger\')">Next Trigger →</button>')
+    parts.append('</div>')
+    parts.append('</div>')
+
+    # Buttons Section (collapsible)
+    parts.append('<div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #3d3d3d;">')
+    parts.append('<div style="display: flex; justify-content: space-between; align-items: center;">')
+    parts.append('<div style="cursor: pointer; display: flex; align-items: center; gap: 8px;" onclick="toggleCuezButtons()">')
+    parts.append('<span id="cuez-buttons-arrow" style="transition: transform 0.2s; display: inline-block;">▶</span>')
+    parts.append('<h3 style="margin: 0; font-size: 16px; font-weight: 600;">Buttons</h3>')
+    parts.append('</div>')
+    parts.append('<button type="button" class="secondary" onclick="refreshCuezButtons()" style="padding: 6px 12px; font-size: 12px;">Refresh List</button>')
+    parts.append('</div>')
+    parts.append('<div id="cuez-buttons-content" style="display: none; margin-top: 12px;">')
+    parts.append('<div id="cuez-buttons-list" style="max-height: 300px; overflow-y: auto; background: #252525; border-radius: 8px; padding: 12px;">')
+    parts.append('<p style="color: #888; margin: 0; font-size: 12px;">Click "Refresh List" to load buttons from Cuez.</p>')
+    parts.append('</div>')
+    parts.append('</div>')
+    parts.append('</div>')
+
+    # Macros Section (collapsible)
+    parts.append('<div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #3d3d3d;">')
+    parts.append('<div style="display: flex; justify-content: space-between; align-items: center;">')
+    parts.append('<div style="cursor: pointer; display: flex; align-items: center; gap: 8px;" onclick="toggleCuezMacros()">')
+    parts.append('<span id="cuez-macros-arrow" style="transition: transform 0.2s; display: inline-block;">▶</span>')
+    parts.append('<h3 style="margin: 0; font-size: 16px; font-weight: 600;">Macros</h3>')
+    parts.append('</div>')
+    parts.append('<button type="button" class="secondary" onclick="refreshCuezMacros()" style="padding: 6px 12px; font-size: 12px;">Refresh List</button>')
+    parts.append('</div>')
+    parts.append('<div id="cuez-macros-content" style="display: none; margin-top: 12px;">')
+    parts.append('<div id="cuez-macros-list" style="max-height: 300px; overflow-y: auto; background: #252525; border-radius: 8px; padding: 12px;">')
+    parts.append('<p style="color: #888; margin: 0; font-size: 12px;">Click "Refresh List" to load macros from Cuez.</p>')
+    parts.append('</div>')
+    parts.append('</div>')
+    parts.append('</div>')
+
+    # HTTP Command URLs Section (collapsible)
+    base_url = f"http://localhost:{effective_port()}"
+    parts.append('<div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #3d3d3d;">')
+    parts.append('<div style="cursor: pointer; display: flex; align-items: center; gap: 8px;" onclick="toggleCuezHttpCommands()">')
+    parts.append('<span id="cuez-http-commands-arrow" style="transition: transform 0.2s; display: inline-block;">▶</span>')
+    parts.append('<h3 style="margin: 0; font-size: 16px; font-weight: 600;">HTTP Command URLs</h3>')
+    parts.append('</div>')
+    parts.append('<div id="cuez-http-commands-content" style="display: none; margin-top: 12px;">')
+    parts.append('<p style="color: #888; margin: 0 0 12px 0; font-size: 12px;">Click any URL to copy. Use GET endpoints for easy URL triggering.</p>')
+    parts.append('<div style="display: grid; gap: 8px;">')
+    # Navigation commands
+    parts.append('<label style="font-size: 11px; color: #666; margin-top: 8px;">Navigation</label>')
+    parts.append(f'<div class="cmd-url" onclick="copyToClipboard(this)">{base_url}/cuez/nav/next</div>')
+    parts.append(f'<div class="cmd-url" onclick="copyToClipboard(this)">{base_url}/cuez/nav/previous</div>')
+    parts.append(f'<div class="cmd-url" onclick="copyToClipboard(this)">{base_url}/cuez/nav/first-trigger</div>')
+    parts.append(f'<div class="cmd-url" onclick="copyToClipboard(this)">{base_url}/cuez/nav/next-trigger</div>')
+    parts.append(f'<div class="cmd-url" onclick="copyToClipboard(this)">{base_url}/cuez/nav/previous-trigger</div>')
+    parts.append('</div>')
+    parts.append('</div>')  # Close http commands content
+    parts.append('</div>')  # Close http commands section
+
+    parts.append('</div>')  # Close cuez-content
+    parts.append('</fieldset>')  # Close Cuez fieldset
+
+    # iNews Cleaner Module
+    inews_enabled = "checked" if CONFIG.enable_inews else ""
+    inews_display = "block" if CONFIG.enable_inews else "none"
+
+    parts.append('<fieldset class="module-card"><legend>iNews Cleaner</legend>')
+    parts.append('<div class="module-header">')
+    parts.append('<p class="module-title">iNews Text Cleaner</p>')
+    parts.append('<label class="toggle-switch"><input type="checkbox" id="inews-enabled" ' + inews_enabled + ' onchange="toggleInewsModule()" /><span class="toggle-slider"></span></label>')
+    parts.append('</div>')
+    parts.append('<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">')
+    parts.append('<p style="color: #8b949e; margin: 0;">Remove formatting grommets from iNews exports for clean text output.</p>')
+    parts.append('<a href="/inews/control" target="_blank" style="display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; background: #3d3d3d; color: #fff; text-decoration: none; border-radius: 6px; font-size: 12px; font-weight: 500; transition: background 0.2s;">Open Standalone <span style="font-size: 10px;">↗</span></a>')
+    parts.append('</div>')
+
+    # iNews content container
+    parts.append(f'<div id="inews-content" style="display: {inews_display};">')
+
+    # Two-column layout for input and output
+    parts.append('<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 16px;">')
+
+    # Input column
+    parts.append('<div>')
+    parts.append('<label style="display: block; margin-bottom: 8px; font-weight: 600; font-size: 13px;">Raw iNews Text</label>')
+    parts.append('<textarea id="inews-input" style="width: 100%; height: 300px; padding: 12px; background: #1e1e1e; border: 1px solid #3d3d3d; border-radius: 6px; color: #fff; font-family: monospace; font-size: 12px; resize: vertical;" placeholder="Paste your iNews text here..."></textarea>')
+    parts.append('</div>')
+
+    # Output column
+    parts.append('<div>')
+    parts.append('<label style="display: block; margin-bottom: 8px; font-weight: 600; font-size: 13px;">Cleaned Output</label>')
+    parts.append('<textarea id="inews-output" style="width: 100%; height: 300px; padding: 12px; background: #1e1e1e; border: 1px solid #3d3d3d; border-radius: 6px; color: #fff; font-family: monospace; font-size: 12px; resize: vertical;" readonly placeholder="Cleaned text will appear here..."></textarea>')
+    parts.append('</div>')
+
+    parts.append('</div>')  # Close grid
+
+    # Clean button and status
+    parts.append('<div class="btn-row" style="margin-top: 16px;">')
+    parts.append('<button type="button" onclick="cleanInewsText()">Clean Text</button>')
+    parts.append('<button type="button" class="secondary" onclick="copyInewsOutput()">Copy Output</button>')
+    parts.append('<button type="button" class="secondary" onclick="clearInewsFields()">Clear All</button>')
+    parts.append('<span id="inews-status" class="status idle"></span>')
+    parts.append('</div>')
+
+    parts.append('</div>')  # Close inews-content
+    parts.append('</fieldset>')  # Close iNews fieldset
 
     # JavaScript - use a list and join with newlines
     js_lines = [
@@ -2993,6 +3591,342 @@ def modules_page():
         "    startAutoSyncStatusPolling();",
         "  }",
         "});",
+        "",
+        "// ========== CUEZ FUNCTIONS ==========",
+        "",
+        "async function toggleCuezModule() {",
+        '  const enabled = document.getElementById("cuez-enabled").checked;',
+        '  const content = document.getElementById("cuez-content");',
+        '  await postJSON("/config/module/cuez", { enabled });',
+        "  if (enabled) {",
+        '    content.style.display = "block";',
+        "  } else {",
+        '    content.style.display = "none";',
+        "  }",
+        "}",
+        "",
+        "async function saveCuezConfig() {",
+        '  const form = document.getElementById("cuez-form");',
+        '  const status = document.getElementById("cuez-status");',
+        "  const data = {",
+        '    host: form.querySelector("[name=cuez_host]").value,',
+        '    port: parseInt(form.querySelector("[name=cuez_port]").value) || 7070,',
+        "  };",
+        "  try {",
+        '    status.textContent = "Saving...";',
+        '    status.className = "status";',
+        '    await postJSON("/config/cuez", data);',
+        '    status.textContent = "Saved!";',
+        '    status.className = "status success";',
+        "  } catch (e) {",
+        '    status.textContent = "Error saving";',
+        '    status.className = "status error";',
+        "  }",
+        "}",
+        "",
+        "async function testCuezConnection() {",
+        '  const status = document.getElementById("cuez-status");',
+        "  try {",
+        '    status.textContent = "Testing...";',
+        '    status.className = "status";',
+        '    const res = await fetch("/cuez/test");',
+        "    const data = await res.json();",
+        "    if (data.ok) {",
+        '      status.textContent = "Connected: " + (data.url || data.host);',
+        '      status.className = "status success";',
+        "    } else {",
+        '      // Truncate long error messages',
+        '      let errMsg = data.error || "Unknown error";',
+        '      if (errMsg.length > 60) errMsg = errMsg.substring(0, 60) + "...";',
+        '      status.textContent = "Failed: " + errMsg;',
+        '      status.title = data.error;  // Full error on hover',
+        '      status.className = "status error";',
+        "    }",
+        "  } catch (e) {",
+        '    status.textContent = "Connection failed: " + e.message;',
+        '    status.className = "status error";',
+        "  }",
+        "}",
+        "",
+        "async function cuezNav(action) {",
+        "  try {",
+        '    const res = await fetch("/cuez/nav/" + action);',
+        "    const data = await res.json();",
+        "    if (!data.ok) {",
+        '      console.error("Cuez nav failed:", data.error);',
+        "    }",
+        "  } catch (e) {",
+        '    console.error("Cuez nav error:", e);',
+        "  }",
+        "}",
+        "",
+        "function toggleCuezButtons() {",
+        '  const content = document.getElementById("cuez-buttons-content");',
+        '  const arrow = document.getElementById("cuez-buttons-arrow");',
+        '  if (content.style.display === "none") {',
+        '    content.style.display = "block";',
+        '    arrow.style.transform = "rotate(90deg)";',
+        "  } else {",
+        '    content.style.display = "none";',
+        '    arrow.style.transform = "rotate(0deg)";',
+        "  }",
+        "}",
+        "",
+        "function toggleCuezMacros() {",
+        '  const content = document.getElementById("cuez-macros-content");',
+        '  const arrow = document.getElementById("cuez-macros-arrow");',
+        '  if (content.style.display === "none") {',
+        '    content.style.display = "block";',
+        '    arrow.style.transform = "rotate(90deg)";',
+        "  } else {",
+        '    content.style.display = "none";',
+        '    arrow.style.transform = "rotate(0deg)";',
+        "  }",
+        "}",
+        "",
+        "async function refreshCuezButtons() {",
+        '  const listEl = document.getElementById("cuez-buttons-list");',
+        '  const content = document.getElementById("cuez-buttons-content");',
+        '  const arrow = document.getElementById("cuez-buttons-arrow");',
+        '  listEl.innerHTML = "<p style=\\"color: #888; margin: 0; font-size: 12px;\\">Loading...</p>";',
+        "  // Auto-expand when refreshing",
+        '  content.style.display = "block";',
+        '  arrow.style.transform = "rotate(90deg)";',
+        "  try {",
+        '    const res = await fetch("/cuez/buttons");',
+        "    const data = await res.json();",
+        "    if (data.ok && data.buttons && data.buttons.length > 0) {",
+        '      let html = "";',
+        "      for (const btn of data.buttons) {",
+        '        const btnId = btn.id || btn.Id || btn._id;',
+        '        const btnName = btn.title || btn.name || btn.Name || btn.label || btnId;',
+        "        html += `<div style=\"margin-bottom: 8px;\">`; ",
+        "        html += `<div style=\"display: flex; align-items: center; justify-content: space-between; padding: 8px; background: #1e1e1e; border-radius: 4px;\">`; ",
+        "        html += `<span style=\"font-size: 13px; font-weight: 500;\">${btnName}</span>`; ",
+        "        html += `<div style=\"display: flex; gap: 4px;\">`; ",
+        "        html += `<button onclick=\"cuezFireButton('${btnId}')\" style=\"padding: 4px 8px; font-size: 11px;\">Click</button>`; ",
+        "        html += `<button onclick=\"cuezButtonOn('${btnId}')\" class=\"secondary\" style=\"padding: 4px 8px; font-size: 11px;\">ON</button>`; ",
+        "        html += `<button onclick=\"cuezButtonOff('${btnId}')\" class=\"secondary\" style=\"padding: 4px 8px; font-size: 11px;\">OFF</button>`; ",
+        "        html += `</div></div>`; ",
+        "        html += `<div class=\"cmd-url\" onclick=\"copyToClipboard(this)\" style=\"margin-top: 4px; font-size: 10px; padding: 6px 10px;\">${btnId}</div>`; ",
+        "        html += `</div>`; ",
+        "      }",
+        "      listEl.innerHTML = html;",
+        "    } else if (data.ok && (!data.buttons || data.buttons.length === 0)) {",
+        '      listEl.innerHTML = "<p style=\\"color: #888; margin: 0; font-size: 12px;\\">No buttons found.</p>";',
+        "    } else {",
+        '      listEl.innerHTML = "<p style=\\"color: #e74c3c; margin: 0; font-size: 12px;\\">Error: " + (data.error || "Unknown error") + "</p>";',
+        "    }",
+        "  } catch (e) {",
+        '    listEl.innerHTML = "<p style=\\"color: #e74c3c; margin: 0; font-size: 12px;\\">Failed to load buttons: " + e.message + "</p>";',
+        "  }",
+        "}",
+        "",
+        "async function cuezFireButton(btnId) {",
+        "  try {",
+        '    await fetch("/cuez/buttons/" + encodeURIComponent(btnId) + "/fire", { method: "POST" });',
+        "  } catch (e) {",
+        '    console.error("Cuez fire button error:", e);',
+        "  }",
+        "}",
+        "",
+        "async function cuezButtonOn(btnId) {",
+        "  try {",
+        '    await fetch("/cuez/buttons/" + encodeURIComponent(btnId) + "/on", { method: "POST" });',
+        "  } catch (e) {",
+        '    console.error("Cuez button ON error:", e);',
+        "  }",
+        "}",
+        "",
+        "async function cuezButtonOff(btnId) {",
+        "  try {",
+        '    await fetch("/cuez/buttons/" + encodeURIComponent(btnId) + "/off", { method: "POST" });',
+        "  } catch (e) {",
+        '    console.error("Cuez button OFF error:", e);',
+        "  }",
+        "}",
+        "",
+        "async function refreshCuezMacros() {",
+        '  const listEl = document.getElementById("cuez-macros-list");',
+        '  const content = document.getElementById("cuez-macros-content");',
+        '  const arrow = document.getElementById("cuez-macros-arrow");',
+        '  listEl.innerHTML = "<p style=\\"color: #888; margin: 0; font-size: 12px;\\">Loading...</p>";',
+        "  // Auto-expand when refreshing",
+        '  content.style.display = "block";',
+        '  arrow.style.transform = "rotate(90deg)";',
+        "  try {",
+        '    const res = await fetch("/cuez/macros");',
+        "    const data = await res.json();",
+        "    if (data.ok && data.macros && data.macros.length > 0) {",
+        '      let html = "";',
+        "      for (const macro of data.macros) {",
+        '        const macroId = macro.id || macro.Id || macro._id;',
+        '        const macroName = macro.title || macro.name || macro.Name || macro.label || macroId;',
+        "        html += `<div style=\"margin-bottom: 8px;\">`; ",
+        "        html += `<div style=\"display: flex; align-items: center; justify-content: space-between; padding: 8px; background: #1e1e1e; border-radius: 4px;\">`; ",
+        "        html += `<span style=\"font-size: 13px; font-weight: 500;\">${macroName}</span>`; ",
+        "        html += `<button onclick=\"cuezRunMacro('${macroId}')\" style=\"padding: 4px 8px; font-size: 11px;\">Run</button>`; ",
+        "        html += `</div>`; ",
+        "        html += `<div class=\"cmd-url\" onclick=\"copyToClipboard(this)\" style=\"margin-top: 4px; font-size: 10px; padding: 6px 10px;\">${macroId}</div>`; ",
+        "        html += `</div>`; ",
+        "      }",
+        "      listEl.innerHTML = html;",
+        "    } else if (data.ok && (!data.macros || data.macros.length === 0)) {",
+        '      listEl.innerHTML = "<p style=\\"color: #888; margin: 0; font-size: 12px;\\">No macros found.</p>";',
+        "    } else {",
+        '      listEl.innerHTML = "<p style=\\"color: #e74c3c; margin: 0; font-size: 12px;\\">Error: " + (data.error || "Unknown error") + "</p>";',
+        "    }",
+        "  } catch (e) {",
+        '    listEl.innerHTML = "<p style=\\"color: #e74c3c; margin: 0; font-size: 12px;\\">Failed to load macros: " + e.message + "</p>";',
+        "  }",
+        "}",
+        "",
+        "async function cuezRunMacro(macroId) {",
+        "  try {",
+        '    await fetch("/cuez/macros/" + encodeURIComponent(macroId) + "/run", { method: "POST" });',
+        "  } catch (e) {",
+        '    console.error("Cuez run macro error:", e);',
+        "  }",
+        "}",
+        "",
+        "function toggleCuezHttpCommands() {",
+        '  const content = document.getElementById("cuez-http-commands-content");',
+        '  const arrow = document.getElementById("cuez-http-commands-arrow");',
+        '  if (content.style.display === "none") {',
+        '    content.style.display = "block";',
+        '    arrow.style.transform = "rotate(90deg)";',
+        "  } else {",
+        '    content.style.display = "none";',
+        '    arrow.style.transform = "rotate(0deg)";',
+        "  }",
+        "}",
+        "",
+        "// Load cached buttons/macros on page load",
+        f"const cachedButtons = {json.dumps(CONFIG.cuez_cached_buttons)};",
+        f"const cachedMacros = {json.dumps(CONFIG.cuez_cached_macros)};",
+        "",
+        "function loadCachedButtons() {",
+        '  const listEl = document.getElementById("cuez-buttons-list");',
+        "  if (cachedButtons && cachedButtons.length > 0) {",
+        '    let html = "";',
+        "    for (const btn of cachedButtons) {",
+        '      const btnId = btn.id || btn.Id || btn._id;',
+        '      const btnName = btn.title || btn.name || btn.Name || btn.label || btnId;',
+        "      html += `<div style=\"margin-bottom: 8px;\">`; ",
+        "      html += `<div style=\"display: flex; align-items: center; justify-content: space-between; padding: 8px; background: #1e1e1e; border-radius: 4px;\">`; ",
+        "      html += `<span style=\"font-size: 13px; font-weight: 500;\">${btnName}</span>`; ",
+        "      html += `<div style=\"display: flex; gap: 4px;\">`; ",
+        "      html += `<button onclick=\"cuezFireButton('${btnId}')\" style=\"padding: 4px 8px; font-size: 11px;\">Click</button>`; ",
+        "      html += `<button onclick=\"cuezButtonOn('${btnId}')\" class=\"secondary\" style=\"padding: 4px 8px; font-size: 11px;\">ON</button>`; ",
+        "      html += `<button onclick=\"cuezButtonOff('${btnId}')\" class=\"secondary\" style=\"padding: 4px 8px; font-size: 11px;\">OFF</button>`; ",
+        "      html += `</div></div>`; ",
+        "      html += `<div class=\"cmd-url\" onclick=\"copyToClipboard(this)\" style=\"margin-top: 4px; font-size: 10px; padding: 6px 10px;\">${btnId}</div>`; ",
+        "      html += `</div>`; ",
+        "    }",
+        "    listEl.innerHTML = html;",
+        "  }",
+        "}",
+        "",
+        "function loadCachedMacros() {",
+        '  const listEl = document.getElementById("cuez-macros-list");',
+        "  if (cachedMacros && cachedMacros.length > 0) {",
+        '    let html = "";',
+        "    for (const macro of cachedMacros) {",
+        '      const macroId = macro.id || macro.Id || macro._id;',
+        '      const macroName = macro.title || macro.name || macro.Name || macro.label || macroId;',
+        "      html += `<div style=\"margin-bottom: 8px;\">`; ",
+        "      html += `<div style=\"display: flex; align-items: center; justify-content: space-between; padding: 8px; background: #1e1e1e; border-radius: 4px;\">`; ",
+        "      html += `<span style=\"font-size: 13px; font-weight: 500;\">${macroName}</span>`; ",
+        "      html += `<button onclick=\"cuezRunMacro('${macroId}')\" style=\"padding: 4px 8px; font-size: 11px;\">Run</button>`; ",
+        "      html += `</div>`; ",
+        "      html += `<div class=\"cmd-url\" onclick=\"copyToClipboard(this)\" style=\"margin-top: 4px; font-size: 10px; padding: 6px 10px;\">${macroId}</div>`; ",
+        "      html += `</div>`; ",
+        "    }",
+        "    listEl.innerHTML = html;",
+        "  }",
+        "}",
+        "",
+        "// Load cached data on page load",
+        "document.addEventListener('DOMContentLoaded', function() {",
+        "  loadCachedButtons();",
+        "  loadCachedMacros();",
+        "});",
+        "",
+        "// ========== iNEWS CLEANER FUNCTIONS ==========",
+        "",
+        "async function toggleInewsModule() {",
+        '  const enabled = document.getElementById("inews-enabled").checked;',
+        '  const content = document.getElementById("inews-content");',
+        '  await postJSON("/config/module/inews", { enabled });',
+        '  content.style.display = enabled ? "block" : "none";',
+        "}",
+        "",
+        "async function cleanInewsText() {",
+        '  const input = document.getElementById("inews-input");',
+        '  const output = document.getElementById("inews-output");',
+        '  const status = document.getElementById("inews-status");',
+        "",
+        "  const rawText = input.value;",
+        "  if (!rawText.trim()) {",
+        '    status.textContent = "Please enter some text";',
+        '    status.className = "status error";',
+        "    setTimeout(() => { status.className = 'status idle'; status.textContent = ''; }, 3000);",
+        "    return;",
+        "  }",
+        "",
+        "  try {",
+        '    status.textContent = "Cleaning...";',
+        '    status.className = "status";',
+        "",
+        '    const res = await fetch("/inews/clean", {',
+        '      method: "POST",',
+        '      headers: { "Content-Type": "application/json" },',
+        "      body: JSON.stringify({ text: rawText }),",
+        "    });",
+        "",
+        "    const data = await res.json();",
+        "",
+        "    if (data.ok) {",
+        "      output.value = data.cleaned;",
+        '      status.textContent = "Text cleaned successfully";',
+        '      status.className = "status success";',
+        "      setTimeout(() => { status.className = 'status idle'; status.textContent = ''; }, 3000);",
+        "    } else {",
+        '      status.textContent = "Error: " + (data.error || "Unknown error");',
+        '      status.className = "status error";',
+        "    }",
+        "  } catch (e) {",
+        '    status.textContent = "Error: " + e.message;',
+        '    status.className = "status error";',
+        "  }",
+        "}",
+        "",
+        "function copyInewsOutput() {",
+        '  const output = document.getElementById("inews-output");',
+        '  const status = document.getElementById("inews-status");',
+        "",
+        "  if (!output.value.trim()) {",
+        '    status.textContent = "Nothing to copy";',
+        '    status.className = "status error";',
+        "    setTimeout(() => { status.className = 'status idle'; status.textContent = ''; }, 2000);",
+        "    return;",
+        "  }",
+        "",
+        "  output.select();",
+        "  document.execCommand('copy');",
+        "",
+        '  status.textContent = "Copied to clipboard!";',
+        '  status.className = "status success";',
+        "  setTimeout(() => { status.className = 'status idle'; status.textContent = ''; }, 2000);",
+        "}",
+        "",
+        "function clearInewsFields() {",
+        '  document.getElementById("inews-input").value = "";',
+        '  document.getElementById("inews-output").value = "";',
+        '  const status = document.getElementById("inews-status");',
+        '  status.textContent = "";',
+        '  status.className = "status idle";',
+        "}",
     ]
     parts.append("\n".join(js_lines))
 
@@ -3061,8 +3995,9 @@ def integrations_redirect():
 
 
 @app.get("/tfl/control", response_class=HTMLResponse)
-def tfl_manual_standalone():
+def tfl_manual_standalone(request: Request):
     """Standalone TFL manual control page for external operators."""
+    base_url = _base_url(request)
     parts: List[str] = []
     parts.append("<!DOCTYPE html>")
     parts.append("<html><head>")
@@ -3090,6 +4025,8 @@ def tfl_manual_standalone():
     parts.append("  .btn-primary:hover { background: #0097a7; }")
     parts.append("  .btn-secondary { background: #3d3d3d; color: #fff; }")
     parts.append("  .btn-secondary:hover { background: #4d4d4d; }")
+    parts.append("  .btn-danger { background: #db422d; color: #fff; }")
+    parts.append("  .btn-danger:hover { background: #b8351f; }")
     parts.append("  .status { text-align: center; margin-top: 16px; font-size: 13px; color: #888; }")
     parts.append("  .status.success { color: #4caf50; }")
     parts.append("  .status.error { color: #ff5252; }")
@@ -3132,6 +4069,7 @@ def tfl_manual_standalone():
     parts.append('<div class="actions">')
     parts.append('<button class="btn-primary" onclick="sendUpdate()">Send Update</button>')
     parts.append('<button class="btn-secondary" onclick="resetAll()">Reset All</button>')
+    parts.append('<button class="btn-danger" onclick="sendLiveUpdate()">Send Live Update</button>')
     parts.append("</div>")
     parts.append('<div class="status" id="status"></div>')
     parts.append("</div>")  # Close container
@@ -3175,6 +4113,36 @@ def tfl_manual_standalone():
     parts.append("    status.className = 'status error';")
     parts.append("  }")
     parts.append("}")
+    parts.append("async function sendLiveUpdate() {")
+    parts.append("  const status = document.getElementById('status');")
+    parts.append("  status.textContent = 'Fetching live TfL data...';")
+    parts.append("  status.className = 'status';")
+    parts.append("  try {")
+    parts.append("    const res = await fetch('/update_now');")
+    parts.append("    const data = await res.json();")
+    parts.append("    if (data.ok) {")
+    parts.append("      status.textContent = 'Live update sent successfully';")
+    parts.append("      status.className = 'status success';")
+    parts.append("      // Update input fields with live data")
+    parts.append("      if (data.line_statuses) {")
+    parts.append("        Object.entries(data.line_statuses).forEach(([line, statusText]) => {")
+    parts.append("          const safeId = line.replace(/ /g, '-').replace(/&/g, 'and');")
+    parts.append("          const input = document.getElementById('manual-' + safeId);")
+    parts.append("          if (input) {")
+    parts.append("            input.value = statusText;")
+    parts.append("            input.style.background = (statusText === 'Good Service') ? '#0c6473' : '#db422d';")
+    parts.append("          }")
+    parts.append("        });")
+    parts.append("      }")
+    parts.append("    } else {")
+    parts.append("      status.textContent = 'Failed to fetch live update: ' + (data.error || 'Unknown error');")
+    parts.append("      status.className = 'status error';")
+    parts.append("    }")
+    parts.append("  } catch (e) {")
+    parts.append("    status.textContent = 'Error: ' + e.message;")
+    parts.append("    status.className = 'status error';")
+    parts.append("  }")
+    parts.append("}")
     parts.append("function resetAll() {")
     parts.append("  TFL_LINES.forEach(line => {")
     parts.append("    const safeId = line.replace(/ /g, '-').replace(/&/g, 'and');")
@@ -3182,6 +4150,188 @@ def tfl_manual_standalone():
     parts.append("    if (input) { input.value = ''; input.style.background = '#0c6473'; }")
     parts.append("  });")
     parts.append("  document.getElementById('status').textContent = '';")
+    parts.append("}")
+    parts.append("</script>")
+    parts.append("</body></html>")
+    return HTMLResponse("".join(parts))
+
+
+@app.get("/cuez/control", response_class=HTMLResponse)
+def cuez_control_standalone(request: Request):
+    """Standalone Cuez Automator control page."""
+    base_url = _base_url(request)
+    parts = ["<!DOCTYPE html><html><head><title>Cuez Control</title>"]
+    parts.append('<link rel="icon" href="/static/favicon.ico">')
+    parts.append("<style>")
+    parts.append("@font-face { font-family: 'ITVReem'; src: url('/static/ITV Reem-Regular.ttf') format('truetype'); font-weight: 400; }")
+    parts.append("@font-face { font-family: 'ITVReem'; src: url('/static/ITV Reem-Medium.ttf') format('truetype'); font-weight: 500; }")
+    parts.append("@font-face { font-family: 'ITVReem'; src: url('/static/ITV Reem-Bold.ttf') format('truetype'); font-weight: 700; }")
+    parts.append("* { box-sizing: border-box; margin: 0; padding: 0; }")
+    parts.append("body { font-family: 'ITVReem', -apple-system, sans-serif; background: #1a1a1a; color: #fff; padding: 20px; }")
+    parts.append(".container { max-width: 1200px; margin: 0 auto; }")
+    parts.append("h1 { text-align: center; margin-bottom: 20px; }")
+    parts.append(".section { background: #252525; padding: 20px; border-radius: 8px; margin-bottom: 20px; }")
+    parts.append(".nav-btn { padding: 12px 24px; margin: 5px; background: #00bcd4; color: #fff; border: none; border-radius: 6px; cursor: pointer; }")
+    parts.append(".list { max-height: 400px; overflow-y: auto; }")
+    parts.append(".item { padding: 10px; margin: 5px 0; background: #1e1e1e; border-radius: 4px; display: flex; justify-content: space-between; align-items: center; }")
+    parts.append("button { padding: 8px 16px; background: #00bcd4; color: #fff; border: none; border-radius: 4px; cursor: pointer; }")
+    parts.append("button:hover { background: #0097a7; }")
+    parts.append(".id { font-size: 10px; color: #666; font-family: monospace; cursor: pointer; }")
+    parts.append(".id:hover { color: #00bcd4; }</style></head><body><div class='container'>")
+    parts.append("<h1>Cuez Automator Control</h1>")
+    parts.append("<div class='section'><h2>Navigation</h2>")
+    parts.append("<button class='nav-btn' onclick=\"nav('next')\">Next</button>")
+    parts.append("<button class='nav-btn' onclick=\"nav('previous')\">Previous</button>")
+    parts.append("<button class='nav-btn' onclick=\"nav('first-trigger')\">First</button></div>")
+    parts.append("<div style='display:grid;grid-template-columns:1fr 1fr;gap:20px;'>")
+    parts.append("<div class='section'><h2>Buttons</h2><div id='buttons' class='list'></div></div>")
+    parts.append("<div class='section'><h2>Macros</h2><div id='macros' class='list'></div></div>")
+    parts.append("<div class='section'><h2>Items</h2><button onclick='loadItems()'>Load</button><div id='items' class='list'></div></div>")
+    parts.append("<div class='section'><h2>Blocks</h2><button onclick='loadBlocks()'>Load</button><div id='blocks' class='list'></div></div></div>")
+    parts.append(f"<script>const btns={json.dumps(CONFIG.cuez_cached_buttons)};const macs={json.dumps(CONFIG.cuez_cached_macros)};")
+    parts.append("function copy(t){navigator.clipboard.writeText(t);}")
+    parts.append("async function nav(a){await fetch(`/cuez/nav/${a}`);}")
+    parts.append("document.getElementById('buttons').innerHTML=btns.map(b=>`<div class='item'><div><div>${b.title||b.id}</div><div class='id' onclick='copy(\"${b.id}\")'>${b.id}</div></div><button onclick='fetch(\"/cuez/buttons/${b.id}/fire\",{method:\"POST\"})'>Fire</button></div>`).join('');")
+    parts.append("document.getElementById('macros').innerHTML=macs.map(m=>`<div class='item'><div><div>${m.title||m.id}</div><div class='id' onclick='copy(\"${m.id}\")'>${m.id}</div></div><button onclick='fetch(\"/cuez/macros/${m.id}/run\",{method:\"POST\"})'>Run</button></div>`).join('');")
+    parts.append("async function loadItems(){const r=await fetch('/cuez/items');const d=await r.json();if(d.ok&&d.items)document.getElementById('items').innerHTML=d.items.map(i=>{const id=i.id||i.Id||i._id||'';const name=i.name||i.title||i.Name||id;return`<div class='item'><div><div>${name}</div><div class='id' onclick='copy(\"${id}\")'>${id}</div></div></div>`;}).join('');}")
+    parts.append("async function loadBlocks(){const r=await fetch('/cuez/blocks');const d=await r.json();if(d.ok&&d.blocks){const blocksArray=Object.values(d.blocks);document.getElementById('blocks').innerHTML=blocksArray.map(b=>{const id=b.id||b.Id||b._id||'';const name=(b.title&&b.title.title)||b.name||b.Name||id;return`<div class='item'><div><div>${name}</div><div class='id' onclick='copy(\"${id}\")'>${id}</div></div><button onclick='fetch(\"/cuez/trigger/${id}\")'>Trigger</button></div>`;}).join('');}}")
+    parts.append("</script></body></html>")
+    return HTMLResponse("".join(parts))
+
+
+@app.get("/inews/control", response_class=HTMLResponse)
+def inews_control_standalone(request: Request):
+    """Standalone iNews Cleaner page."""
+    base_url = _base_url(request)
+    parts = ["<!DOCTYPE html><html><head><title>iNews Cleaner</title>"]
+    parts.append('<link rel="icon" href="/static/favicon.ico">')
+    parts.append('<link rel="icon" type="image/png" href="/static/esc_icon.png">')
+    parts.append("<style>")
+    # Load ITV Reem font
+    parts.append("@font-face { font-family: 'ITVReem'; src: url('/static/ITV Reem-Regular.ttf') format('truetype'); font-weight: 400; }")
+    parts.append("@font-face { font-family: 'ITVReem'; src: url('/static/ITV Reem-Medium.ttf') format('truetype'); font-weight: 500; }")
+    parts.append("@font-face { font-family: 'ITVReem'; src: url('/static/ITV Reem-Bold.ttf') format('truetype'); font-weight: 700; }")
+    # Base styles
+    parts.append("* { box-sizing: border-box; margin: 0; padding: 0; }")
+    parts.append("body { font-family: 'ITVReem', -apple-system, sans-serif; background: #1a1a1a; color: #fff; padding: 20px; min-height: 100vh; }")
+    parts.append(".container { max-width: 1400px; margin: 0 auto; }")
+    parts.append(".header { text-align: center; margin-bottom: 30px; padding-bottom: 20px; border-bottom: 1px solid #3d3d3d; }")
+    parts.append(".header h1 { font-size: 28px; font-weight: 600; margin-bottom: 8px; }")
+    parts.append(".header p { color: #888; font-size: 14px; }")
+    parts.append(".grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }")
+    parts.append(".column { display: flex; flex-direction: column; }")
+    parts.append("label { display: block; margin-bottom: 8px; font-weight: 600; font-size: 14px; color: #00bcd4; }")
+    parts.append("textarea { width: 100%; height: 500px; padding: 16px; background: #252525; border: 1px solid #3d3d3d; border-radius: 8px; color: #fff; font-family: 'Courier New', monospace; font-size: 13px; line-height: 1.5; resize: vertical; }")
+    parts.append("textarea:focus { outline: none; border-color: #00bcd4; box-shadow: 0 0 0 3px rgba(0,188,212,0.2); }")
+    parts.append("textarea::placeholder { color: #666; }")
+    parts.append("textarea[readonly] { background: #1e1e1e; cursor: default; }")
+    parts.append(".button-row { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }")
+    parts.append("button { padding: 12px 24px; background: #00bcd4; color: #fff; border: none; border-radius: 6px; font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.2s; font-family: 'ITVReem', sans-serif; }")
+    parts.append("button:hover { background: #0097a7; transform: translateY(-1px); }")
+    parts.append("button.secondary { background: #3d3d3d; }")
+    parts.append("button.secondary:hover { background: #4d4d4d; }")
+    parts.append(".status { margin-top: 16px; padding: 12px; border-radius: 6px; text-align: center; font-size: 14px; display: none; }")
+    parts.append(".status.success { background: #1b5e20; color: #4caf50; display: block; }")
+    parts.append(".status.error { background: #b71c1c; color: #ef5350; display: block; }")
+    parts.append("</style>")
+    parts.append("</head><body>")
+
+    # Header
+    parts.append('<div class="container">')
+    parts.append('<div class="header">')
+    parts.append('<h1>iNews Text Cleaner</h1>')
+    parts.append('<p>Remove formatting grommets from iNews exports</p>')
+    parts.append('</div>')
+
+    # Two-column grid
+    parts.append('<div class="grid">')
+
+    # Input column
+    parts.append('<div class="column">')
+    parts.append('<label for="input">Raw iNews Text</label>')
+    parts.append('<textarea id="input" placeholder="Paste your iNews text here..."></textarea>')
+    parts.append('</div>')
+
+    # Output column
+    parts.append('<div class="column">')
+    parts.append('<label for="output">Cleaned Output</label>')
+    parts.append('<textarea id="output" readonly placeholder="Cleaned text will appear here..."></textarea>')
+    parts.append('</div>')
+
+    parts.append('</div>')  # End grid
+
+    # Buttons
+    parts.append('<div class="button-row">')
+    parts.append('<button onclick="clean()">Clean Text</button>')
+    parts.append('<button class="secondary" onclick="copy()">Copy Output</button>')
+    parts.append('<button class="secondary" onclick="clear()">Clear All</button>')
+    parts.append('</div>')
+
+    # Status
+    parts.append('<div id="status" class="status"></div>')
+
+    parts.append('</div>')  # End container
+
+    # JavaScript
+    parts.append("<script>")
+    parts.append("async function clean() {")
+    parts.append("  const input = document.getElementById('input');")
+    parts.append("  const output = document.getElementById('output');")
+    parts.append("  const status = document.getElementById('status');")
+    parts.append("  ")
+    parts.append("  if (!input.value.trim()) {")
+    parts.append("    status.textContent = 'Please enter some text';")
+    parts.append("    status.className = 'status error';")
+    parts.append("    setTimeout(() => status.className = 'status', 3000);")
+    parts.append("    return;")
+    parts.append("  }")
+    parts.append("  ")
+    parts.append("  try {")
+    parts.append("    const res = await fetch('/inews/clean', {")
+    parts.append("      method: 'POST',")
+    parts.append("      headers: { 'Content-Type': 'application/json' },")
+    parts.append("      body: JSON.stringify({ text: input.value })")
+    parts.append("    });")
+    parts.append("    const data = await res.json();")
+    parts.append("    ")
+    parts.append("    if (data.ok) {")
+    parts.append("      output.value = data.cleaned;")
+    parts.append("      status.textContent = 'Text cleaned successfully!';")
+    parts.append("      status.className = 'status success';")
+    parts.append("      setTimeout(() => status.className = 'status', 3000);")
+    parts.append("    } else {")
+    parts.append("      status.textContent = 'Error: ' + (data.error || 'Unknown error');")
+    parts.append("      status.className = 'status error';")
+    parts.append("    }")
+    parts.append("  } catch (e) {")
+    parts.append("    status.textContent = 'Error: ' + e.message;")
+    parts.append("    status.className = 'status error';")
+    parts.append("  }")
+    parts.append("}")
+    parts.append("")
+    parts.append("function copy() {")
+    parts.append("  const output = document.getElementById('output');")
+    parts.append("  const status = document.getElementById('status');")
+    parts.append("  ")
+    parts.append("  if (!output.value.trim()) {")
+    parts.append("    status.textContent = 'Nothing to copy';")
+    parts.append("    status.className = 'status error';")
+    parts.append("    setTimeout(() => status.className = 'status', 2000);")
+    parts.append("    return;")
+    parts.append("  }")
+    parts.append("  ")
+    parts.append("  output.select();")
+    parts.append("  document.execCommand('copy');")
+    parts.append("  ")
+    parts.append("  status.textContent = 'Copied to clipboard!';")
+    parts.append("  status.className = 'status success';")
+    parts.append("  setTimeout(() => status.className = 'status', 2000);")
+    parts.append("}")
+    parts.append("")
+    parts.append("function clear() {")
+    parts.append("  document.getElementById('input').value = '';")
+    parts.append("  document.getElementById('output').value = '';")
+    parts.append("  document.getElementById('status').className = 'status';")
     parts.append("}")
     parts.append("</script>")
     parts.append("</body></html>")
