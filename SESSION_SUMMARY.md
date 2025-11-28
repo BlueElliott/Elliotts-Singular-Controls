@@ -2,14 +2,171 @@
 
 ## Project Overview
 **Name:** Elliott's Singular Controls (formerly Singular Tweaks)
-**Version:** 1.1.1
+**Version:** 1.1.2 (in development)
 **Repository:** https://github.com/BlueElliott/Elliotts-Singular-Controls
 
-A premium desktop application for controlling Singular.live graphics with TfL and TriCaster integration.
+A premium desktop application for controlling Singular.live graphics with TfL, TriCaster, Cuez Automator, and iNews integration.
 
 ---
 
-## What's New in v1.1.1
+## What's New in v1.1.2 (In Development)
+
+### Cuez Automator Module - Full Integration
+
+1. **Connection Management**
+   - Connect to Cuez Automator via HTTP API (default port 7070)
+   - Configurable host and port settings
+   - Test connection functionality
+   - Enable/disable module toggle
+
+2. **Button Control**
+   - Fetch and cache all Cuez deck buttons
+   - Fire/click buttons via UI or API
+   - Set button ON/OFF states for switches
+   - Clickable UUIDs for easy copying
+   - Refresh button list on demand
+
+3. **Macro Execution**
+   - Fetch and cache all macros
+   - Run macros via UI or API
+   - Clickable UUIDs for easy copying
+   - Refresh macro list on demand
+
+4. **Navigation Controls**
+   - Next/Previous item navigation
+   - Next/Previous trigger navigation
+   - First trigger navigation
+   - All navigation available via UI buttons or GET endpoints
+
+5. **Rundown Content**
+   - View all items in current rundown
+   - View all blocks (triggers) in current rundown
+   - Trigger specific blocks by ID
+   - Get currently triggered item
+   - Smart display with name and clickable ID
+
+6. **Standalone Control Page**
+   - Full-featured control page at `/cuez/control`
+   - Loads cached buttons/macros on page load
+   - Refresh buttons for items and blocks
+   - Dark theme matching application style
+   - Navigation controls prominently displayed
+
+7. **HTTP Command URLs**
+   - Collapsible section with all navigation URLs
+   - Click-to-copy functionality
+   - Perfect for external triggering or automation
+   - All navigation commands available as GET requests
+
+8. **Configuration**
+   - `enable_cuez` - Module toggle
+   - `cuez_host` - Cuez Automator IP/hostname
+   - `cuez_port` - API port (default 7070)
+   - `cuez_cached_buttons` - Cached button list
+   - `cuez_cached_macros` - Cached macro list
+
+9. **API Endpoints**
+   ```
+   POST /config/module/cuez       - Enable/disable module
+   POST /config/cuez              - Save connection settings
+   GET  /cuez/test                - Test connection
+   GET  /cuez/buttons             - Get all buttons (refreshes cache)
+   POST /cuez/buttons/{id}/fire   - Fire a button
+   POST /cuez/buttons/{id}/on     - Set button ON
+   POST /cuez/buttons/{id}/off    - Set button OFF
+   GET  /cuez/macros              - Get all macros (refreshes cache)
+   POST /cuez/macros/{id}/run     - Run a macro
+   GET  /cuez/nav/next            - Navigate to next
+   GET  /cuez/nav/previous        - Navigate to previous
+   GET  /cuez/nav/first-trigger   - Go to first trigger
+   GET  /cuez/nav/next-trigger    - Navigate to next trigger
+   GET  /cuez/nav/previous-trigger - Navigate to previous trigger
+   GET  /cuez/items               - Get all items
+   GET  /cuez/blocks              - Get all blocks
+   GET  /cuez/current             - Get current trigger
+   GET  /cuez/trigger/{id}        - Trigger specific block
+   ```
+
+### iNews Cleaner Module
+
+1. **Text Cleaning**
+   - Remove formatting grommets from iNews exports
+   - Regex pattern matching for grommet lines: `¤W\d+\s+\d+\s+\]\].*?\[\[\s*$`
+   - Preserves all actual content
+   - Clean output ready for use
+
+2. **Module UI**
+   - Two-column layout (input/output)
+   - Enable/disable module toggle
+   - Clean Text button processes input
+   - Copy Output button copies to clipboard
+   - Clear All button resets both fields
+
+3. **Standalone Page**
+   - Full-featured page at `/inews/control`
+   - Large text areas (500px height) for easier editing
+   - Monospace font for better readability
+   - Same three-button workflow
+   - Dark theme matching application style
+
+4. **API Endpoints**
+   ```
+   POST /config/module/inews  - Enable/disable module
+   POST /inews/clean          - Clean text (body: {text: "..."})
+   ```
+
+### Dynamic Network IP Display
+
+1. **Smart URL Detection**
+   - All HTTP command URLs now dynamic based on access method
+   - Access via `localhost` → URLs show `localhost`
+   - Access via network IP → URLs show that IP
+   - Uses `_base_url(request)` helper with header inspection
+   - Perfect for remote operators and external systems
+
+2. **Desktop GUI Network Display**
+   - Shows network IP on main window below port card
+   - Clickable URL (teal color) copies to clipboard
+   - Hover effect (turns white)
+   - Click feedback in status bar ("✓ Copied: http://...")
+   - Console window shows network IP at startup
+
+3. **Technical Implementation**
+   - Added `get_local_ip()` function using socket routing
+   - Updated all page endpoints to accept `Request` parameter
+   - All command URL sections use dynamic `base_url`
+   - Removed localhost display from desktop GUI
+
+### ITV Reem Font Integration
+
+1. **Complete Font Family**
+   - Light (300) + Italic
+   - Regular (400) + Italic
+   - Medium (500) + Italic
+   - Bold (700) + Italic
+   - Applied across all web pages and desktop GUI
+
+2. **Implementation**
+   - @font-face declarations for all weights
+   - Desktop GUI font loading with fallback
+   - Replaced all Arial references
+   - Professional ITV News branding
+
+### Bug Fixes
+
+1. **Cuez Blocks Display**
+   - Fixed object-to-array conversion for blocks API
+   - Used `Object.values()` before mapping
+   - Proper handling of nested `title.title` field
+   - Smart field detection for various response formats
+
+2. **Missing Import**
+   - Added `Body` to FastAPI imports
+   - Fixed iNews POST endpoint parameter handling
+
+---
+
+## What's in v1.1.1
 
 ### TriCaster Module - Full Implementation
 
