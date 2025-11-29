@@ -29,3 +29,12 @@ elliotts_singular_controls_config.json
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Temporary files
+*.txt.bak
+nul
+cuez_page_code.txt
+cuez_standalone.py
+
+# Font source files (fonts are in static/)
+ITV News fonts/
