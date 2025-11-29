@@ -152,6 +152,81 @@ A premium desktop application for controlling Singular.live graphics with TfL, T
    - Replaced all Arial references
    - Professional ITV News branding
 
+### Cuez-to-CueiT Bridge Module - Automatic Script Synchronization
+
+1. **Independent Cuez Connection**
+   - Separate Cuez host/port configuration (independent from main Cuez module)
+   - Allows using different Cuez instances or using only this module
+   - Default: localhost:7070
+   - Connection test functionality
+
+2. **Script Synchronization**
+   - Fetches scripts from Cuez Automator API (`/api/episode/script`)
+   - Formats scripts with CueiT-compatible slugline markers (`[#] Slugline`)
+   - Saves to configurable output file (default: `C:\CueiT\Import\cuez_live.rtf`)
+   - CueiT auto-detects file changes and reloads script
+   - No manual intervention required after initial setup
+
+3. **Auto-Sync with Background Worker**
+   - Configurable poll interval (1-30 seconds, default: 3 seconds)
+   - Background thread monitors Cuez for script changes
+   - MD5 hash-based change detection (only updates when content changes)
+   - Minimizes unnecessary CueiT reloads
+   - Start/stop worker via API or UI toggle
+
+4. **Format Support**
+   - RTF format with CueiT slugline markers (recommended)
+   - Plain text (.TXT) format option
+   - Automatic character escaping for RTF special characters
+
+5. **Module UI in /modules**
+   - Enable/disable module toggle
+   - Cuez connection settings (host/port)
+   - File browser button for easy output path selection
+   - Format selection (RTF/TXT)
+   - Poll interval configuration
+   - Auto-sync toggle switch
+   - Manual "Sync Now" button
+   - Real-time status display (episode name, story count, worker status, output file)
+   - "How It Works" guide section
+   - Link to standalone page
+
+6. **Standalone Control Page**
+   - Full-featured page at `/cuez-to-cueit/control`
+   - Real-time status dashboard
+   - Auto-sync toggle
+   - Manual sync button
+   - Auto-refreshes every 5 seconds
+   - Clean interface for external operators
+
+7. **API Endpoints**
+   ```
+   GET  /cuez-to-cueit/status       - Get current status
+   GET  /cuez-to-cueit/config       - Get configuration
+   POST /cuez-to-cueit/config       - Update config (host, port, path, format, interval)
+   POST /cuez-to-cueit/sync/now     - Manual sync trigger
+   POST /cuez-to-cueit/sync/enable  - Enable auto-sync and start worker
+   POST /cuez-to-cueit/sync/disable - Disable auto-sync and stop worker
+   POST /config/module/cuez-to-cueit - Enable/disable module
+   ```
+
+8. **Configuration Options**
+   - `cuez_to_cueit_cuez_host` - Cuez Automator hostname/IP
+   - `cuez_to_cueit_cuez_port` - Cuez Automator port
+   - `cuez_to_cueit_output_path` - Output file path for CueiT
+   - `cuez_to_cueit_format` - Output format (rtf/txt)
+   - `cuez_to_cueit_poll_interval` - Polling interval in seconds (1-30)
+   - `cuez_to_cueit_auto_sync` - Auto-sync enabled/disabled
+   - `cuez_to_cueit_last_hash` - MD5 hash of last synced content (for change detection)
+
+9. **Workflow**
+   - User loads episode in Cuez Automator
+   - Module detects change within poll interval (default 3 seconds)
+   - Module formats script as RTF with [#] sluglines
+   - Module saves to configured output file
+   - CueiT detects file modification and auto-reloads
+   - Complete automation - no manual steps required
+
 ### Bug Fixes
 
 1. **Cuez Blocks Display**
