@@ -213,6 +213,15 @@ class AppConfig(BaseModel):
     cuez_cached_macros: List[Dict[str, Any]] = []  # Cached macro list
     # iNews Cleaner module settings
     enable_inews: bool = False
+    # Cuez-to-CueiT Bridge module settings
+    enable_cuez_to_cueit: bool = False
+    cuez_to_cueit_cuez_host: str = "localhost"  # Separate Cuez host for this module
+    cuez_to_cueit_cuez_port: Optional[int] = 7070  # Separate Cuez port for this module
+    cuez_to_cueit_output_path: str = "C:\\CueiT\\Import\\cuez_live.rtf"
+    cuez_to_cueit_format: str = "rtf"  # rtf, txt, or cue
+    cuez_to_cueit_poll_interval: int = 3  # seconds
+    cuez_to_cueit_auto_sync: bool = False
+    cuez_to_cueit_last_hash: str = ""  # For change detection
     theme: str = "dark"
     port: Optional[int] = None
 
@@ -242,6 +251,15 @@ def load_config() -> AppConfig:
         "enable_cuez": False,
         "cuez_host": os.getenv("CUEZ_HOST", "localhost"),
         "cuez_port": int(os.getenv("CUEZ_PORT", "7070")),
+        # Cuez-to-CueiT defaults
+        "enable_cuez_to_cueit": False,
+        "cuez_to_cueit_cuez_host": "localhost",
+        "cuez_to_cueit_cuez_port": 7070,
+        "cuez_to_cueit_output_path": "C:\\CueiT\\Import\\cuez_live.rtf",
+        "cuez_to_cueit_format": "rtf",
+        "cuez_to_cueit_poll_interval": 3,
+        "cuez_to_cueit_auto_sync": False,
+        "cuez_to_cueit_last_hash": "",
         "theme": "dark",
         "port": int(os.getenv("SINGULAR_TWEAKS_PORT")) if os.getenv("SINGULAR_TWEAKS_PORT") else None,
     }
@@ -942,6 +960,232 @@ def cuez_trigger_block(block_id: str) -> Dict[str, Any]:
         return {"ok": False, "error": e.detail}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+# ================== CUEZ-TO-CUEIT BRIDGE HELPERS ==================
+
+import hashlib
+import threading
+
+# Global state for background sync worker
+_cuez_to_cueit_worker_thread: Optional[threading.Thread] = None
+_cuez_to_cueit_worker_running = False
+
+
+def cuez_to_cueit_fetch_script() -> Dict[str, Any]:
+    """Fetch the current script from Cuez Automator using Cuez-to-CueiT's own connection settings."""
+    try:
+        # Use the Cuez-to-CueiT module's own Cuez connection settings
+        if not CONFIG.cuez_to_cueit_cuez_host or not CONFIG.cuez_to_cueit_cuez_port:
+            return {"ok": False, "error": "Cuez host/port not configured for Cuez-to-CueiT module"}
+
+        base_url = f"http://{CONFIG.cuez_to_cueit_cuez_host}:{CONFIG.cuez_to_cueit_cuez_port}"
+        url = f"{base_url}/api/episode/script"
+
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        return {"ok": True, "script": data}
+    except requests.RequestException as e:
+        return {"ok": False, "error": f"Cuez connection error: {str(e)}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def cuez_to_cueit_format_rtf(script_data: Dict[str, Any]) -> str:
+    """
+    Convert Cuez script to RTF format with CueiT slugline format.
+    CueiT expects sluglines in the format: [#] Slugline
+    """
+    rtf_parts = [r"{\rtf1\ansi\deff0"]
+
+    # Extract stories from script
+    stories = script_data.get("stories", [])
+
+    for story in stories:
+        slugline = story.get("slugline", "UNTITLED").strip()
+        body = story.get("body", "").strip()
+
+        # CueiT slugline format: [#] Slugline
+        rtf_parts.append(f"\\par [#] {slugline}\\par\\par")
+
+        # Add story body
+        if body:
+            # Escape special RTF characters
+            body_escaped = body.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+            rtf_parts.append(f"{body_escaped}\\par\\par")
+
+    rtf_parts.append("}")
+    return "".join(rtf_parts)
+
+
+def cuez_to_cueit_format_txt(script_data: Dict[str, Any]) -> str:
+    """
+    Convert Cuez script to plain text format with CueiT slugline format.
+    """
+    txt_parts = []
+
+    stories = script_data.get("stories", [])
+
+    for story in stories:
+        slugline = story.get("slugline", "UNTITLED").strip()
+        body = story.get("body", "").strip()
+
+        # CueiT slugline format: [#] Slugline
+        txt_parts.append(f"[#] {slugline}\n\n")
+
+        if body:
+            txt_parts.append(f"{body}\n\n")
+
+    return "".join(txt_parts)
+
+
+def cuez_to_cueit_save_file(content: str, output_path: str) -> Dict[str, Any]:
+    """Save formatted script to the configured output file."""
+    try:
+        # Create parent directory if it doesn't exist
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+        # Write the file
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        return {"ok": True, "path": output_path, "size": len(content)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def cuez_to_cueit_sync_now() -> Dict[str, Any]:
+    """
+    Manually trigger a sync from Cuez to CueiT.
+    Fetches the current script and saves it to the configured output file.
+    """
+    global CONFIG
+
+    try:
+        # Fetch script from Cuez
+        script_result = cuez_to_cueit_fetch_script()
+        if not script_result["ok"]:
+            return {"ok": False, "error": f"Failed to fetch script: {script_result.get('error')}"}
+
+        script_data = script_result["script"]
+
+        # Format based on configured format
+        if CONFIG.cuez_to_cueit_format == "rtf":
+            content = cuez_to_cueit_format_rtf(script_data)
+        elif CONFIG.cuez_to_cueit_format == "txt":
+            content = cuez_to_cueit_format_txt(script_data)
+        else:
+            return {"ok": False, "error": f"Unsupported format: {CONFIG.cuez_to_cueit_format}"}
+
+        # Calculate hash for change detection
+        content_hash = hashlib.md5(content.encode()).hexdigest()
+
+        # Check if content changed
+        if content_hash == CONFIG.cuez_to_cueit_last_hash:
+            return {"ok": True, "changed": False, "message": "Script unchanged, no update needed"}
+
+        # Save file
+        save_result = cuez_to_cueit_save_file(content, CONFIG.cuez_to_cueit_output_path)
+        if not save_result["ok"]:
+            return {"ok": False, "error": f"Failed to save file: {save_result.get('error')}"}
+
+        # Update hash
+        CONFIG.cuez_to_cueit_last_hash = content_hash
+        save_config(CONFIG)
+
+        # Get episode info
+        episode_name = script_data.get("episode", {}).get("name", "Unknown")
+        story_count = len(script_data.get("stories", []))
+
+        return {
+            "ok": True,
+            "changed": True,
+            "episode": episode_name,
+            "stories": story_count,
+            "path": CONFIG.cuez_to_cueit_output_path,
+            "size": save_result.get("size", 0),
+            "format": CONFIG.cuez_to_cueit_format
+        }
+
+    except Exception as e:
+        logger.error("Cuez-to-CueiT sync error: %s", e)
+        return {"ok": False, "error": str(e)}
+
+
+def cuez_to_cueit_worker():
+    """Background worker that syncs Cuez script to CueiT at regular intervals."""
+    global _cuez_to_cueit_worker_running, CONFIG
+
+    logger.info("Cuez-to-CueiT background worker started")
+
+    while _cuez_to_cueit_worker_running:
+        try:
+            if CONFIG.cuez_to_cueit_auto_sync:
+                result = cuez_to_cueit_sync_now()
+                if result.get("ok") and result.get("changed"):
+                    logger.info(f"Cuez-to-CueiT: Synced {result.get('stories', 0)} stories from '{result.get('episode', 'Unknown')}'")
+        except Exception as e:
+            logger.error(f"Cuez-to-CueiT worker error: {e}")
+
+        # Sleep for the configured interval
+        time.sleep(CONFIG.cuez_to_cueit_poll_interval)
+
+    logger.info("Cuez-to-CueiT background worker stopped")
+
+
+def cuez_to_cueit_start_worker():
+    """Start the background sync worker."""
+    global _cuez_to_cueit_worker_thread, _cuez_to_cueit_worker_running
+
+    if _cuez_to_cueit_worker_thread and _cuez_to_cueit_worker_thread.is_alive():
+        return {"ok": True, "message": "Worker already running"}
+
+    _cuez_to_cueit_worker_running = True
+    _cuez_to_cueit_worker_thread = threading.Thread(target=cuez_to_cueit_worker, daemon=True)
+    _cuez_to_cueit_worker_thread.start()
+
+    logger.info("Started Cuez-to-CueiT background worker")
+    return {"ok": True, "message": "Worker started"}
+
+
+def cuez_to_cueit_stop_worker():
+    """Stop the background sync worker."""
+    global _cuez_to_cueit_worker_running
+
+    _cuez_to_cueit_worker_running = False
+    logger.info("Stopping Cuez-to-CueiT background worker")
+    return {"ok": True, "message": "Worker stopped"}
+
+
+def cuez_to_cueit_get_status() -> Dict[str, Any]:
+    """Get current status of the Cuez-to-CueiT bridge."""
+    global CONFIG, _cuez_to_cueit_worker_thread
+
+    worker_running = _cuez_to_cueit_worker_thread and _cuez_to_cueit_worker_thread.is_alive()
+
+    # Try to get current episode info
+    episode_info = {}
+    try:
+        script_result = cuez_to_cueit_fetch_script()
+        if script_result["ok"]:
+            script_data = script_result["script"]
+            episode_info = {
+                "episode_name": script_data.get("episode", {}).get("name", "Unknown"),
+                "story_count": len(script_data.get("stories", []))
+            }
+    except:
+        pass
+
+    return {
+        "ok": True,
+        "auto_sync_enabled": CONFIG.cuez_to_cueit_auto_sync,
+        "worker_running": worker_running,
+        "output_path": CONFIG.cuez_to_cueit_output_path,
+        "format": CONFIG.cuez_to_cueit_format,
+        "poll_interval": CONFIG.cuez_to_cueit_poll_interval,
+        **episode_info
+    }
 
 
 # ================== iNews CLEANER HELPER ==================
@@ -2020,6 +2264,104 @@ def inews_clean_endpoint(body: dict = Body(...)):
         return {"ok": False, "error": str(e)}
 
 
+# ================== CUEZ-TO-CUEIT MODULE ENDPOINTS ==================
+
+class CuezToCueitConfigIn(BaseModel):
+    cuez_host: Optional[str] = None
+    cuez_port: Optional[int] = None
+    output_path: Optional[str] = None
+    format: Optional[str] = None  # rtf, txt
+    poll_interval: Optional[int] = None
+    auto_sync: Optional[bool] = None
+
+
+@app.get("/cuez-to-cueit/status")
+def get_cuez_to_cueit_status():
+    """Get current status of Cuez-to-CueiT bridge."""
+    return cuez_to_cueit_get_status()
+
+
+@app.get("/cuez-to-cueit/config")
+def get_cuez_to_cueit_config():
+    """Get current configuration."""
+    return {
+        "ok": True,
+        "cuez_host": CONFIG.cuez_to_cueit_cuez_host,
+        "cuez_port": CONFIG.cuez_to_cueit_cuez_port,
+        "output_path": CONFIG.cuez_to_cueit_output_path,
+        "format": CONFIG.cuez_to_cueit_format,
+        "poll_interval": CONFIG.cuez_to_cueit_poll_interval,
+        "auto_sync": CONFIG.cuez_to_cueit_auto_sync,
+        "enabled": CONFIG.enable_cuez_to_cueit
+    }
+
+
+@app.post("/cuez-to-cueit/config")
+def set_cuez_to_cueit_config(config: CuezToCueitConfigIn):
+    """Update Cuez-to-CueiT configuration."""
+    if config.cuez_host is not None:
+        CONFIG.cuez_to_cueit_cuez_host = config.cuez_host
+
+    if config.cuez_port is not None:
+        CONFIG.cuez_to_cueit_cuez_port = config.cuez_port
+
+    if config.output_path is not None:
+        CONFIG.cuez_to_cueit_output_path = config.output_path
+
+    if config.format is not None and config.format in ["rtf", "txt"]:
+        CONFIG.cuez_to_cueit_format = config.format
+
+    if config.poll_interval is not None:
+        # Clamp to 1-30 seconds
+        CONFIG.cuez_to_cueit_poll_interval = max(1, min(30, config.poll_interval))
+
+    if config.auto_sync is not None:
+        CONFIG.cuez_to_cueit_auto_sync = config.auto_sync
+
+    save_config(CONFIG)
+    return {"ok": True, "message": "Configuration updated"}
+
+
+@app.post("/cuez-to-cueit/sync/now")
+def trigger_cuez_to_cueit_sync():
+    """Manually trigger a sync from Cuez to CueiT."""
+    return cuez_to_cueit_sync_now()
+
+
+@app.post("/cuez-to-cueit/sync/enable")
+def enable_cuez_to_cueit_sync():
+    """Enable auto-sync."""
+    CONFIG.cuez_to_cueit_auto_sync = True
+    save_config(CONFIG)
+    result = cuez_to_cueit_start_worker()
+    return result
+
+
+@app.post("/cuez-to-cueit/sync/disable")
+def disable_cuez_to_cueit_sync():
+    """Disable auto-sync."""
+    CONFIG.cuez_to_cueit_auto_sync = False
+    save_config(CONFIG)
+    result = cuez_to_cueit_stop_worker()
+    return result
+
+
+@app.post("/config/module/cuez-to-cueit")
+def configure_cuez_to_cueit_module(body: dict = Body(...)):
+    """Enable/disable Cuez-to-CueiT module."""
+    enabled = body.get("enabled", False)
+    CONFIG.enable_cuez_to_cueit = enabled
+    save_config(CONFIG)
+
+    # Start worker if auto-sync is enabled
+    if enabled and CONFIG.cuez_to_cueit_auto_sync:
+        cuez_to_cueit_start_worker()
+    elif not enabled:
+        cuez_to_cueit_stop_worker()
+
+    return {"ok": True, "enabled": CONFIG.enable_cuez_to_cueit}
+
+
 @app.get("/settings/json")
 def get_settings_json():
     return {
@@ -3096,6 +3438,89 @@ def modules_page(request: Request):
     parts.append('</div>')  # Close inews-content
     parts.append('</fieldset>')  # Close iNews fieldset
 
+    # Cuez-to-CueiT Bridge Module
+    cuez_to_cueit_enabled = "checked" if CONFIG.enable_cuez_to_cueit else ""
+    cuez_to_cueit_display = "block" if CONFIG.enable_cuez_to_cueit else "none"
+    cuez_to_cueit_auto_sync = "checked" if CONFIG.cuez_to_cueit_auto_sync else ""
+    cuez_to_cueit_output_path = html_escape(CONFIG.cuez_to_cueit_output_path)
+    cuez_to_cueit_poll_interval = CONFIG.cuez_to_cueit_poll_interval
+    cuez_to_cueit_cuez_host = html_escape(CONFIG.cuez_to_cueit_cuez_host or "localhost")
+    cuez_to_cueit_cuez_port = CONFIG.cuez_to_cueit_cuez_port or 7070
+
+    parts.append('<fieldset class="module-card"><legend>Cuez-to-CueiT Bridge</legend>')
+    parts.append('<div class="module-header">')
+    parts.append('<p class="module-title">Cuez Automator to CueiT Prompter Bridge</p>')
+    parts.append('<label class="toggle-switch"><input type="checkbox" id="cuez-to-cueit-enabled" ' + cuez_to_cueit_enabled + ' onchange="toggleCuezToCueitModule()" /><span class="toggle-slider"></span></label>')
+    parts.append('</div>')
+    parts.append('<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">')
+    parts.append('<p style="color: #8b949e; margin: 0;">Automatically sync scripts from Cuez Automator to CueiT teleprompter in real-time.</p>')
+    parts.append('<a href="/cuez-to-cueit/control" target="_blank" style="display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; background: #3d3d3d; color: #fff; text-decoration: none; border-radius: 6px; font-size: 12px; font-weight: 500; transition: background 0.2s;">Open Standalone <span style="font-size: 10px;">↗</span></a>')
+    parts.append('</div>')
+
+    # Cuez-to-CueiT content container
+    parts.append(f'<div id="cuez-to-cueit-content" style="display: {cuez_to_cueit_display};">')
+
+    # Cuez Connection Settings
+    parts.append('<div style="margin-bottom: 20px; padding-bottom: 20px; border-bottom: 1px solid #3d3d3d;">')
+    parts.append('<h3 style="margin: 0 0 12px 0; font-size: 16px; font-weight: 600;">Cuez Automator Connection</h3>')
+    parts.append('<p style="color: #888; margin: 0 0 12px 0; font-size: 13px;">Configure connection to Cuez Automator (separate from main Cuez module)</p>')
+    parts.append('<div style="display: grid; grid-template-columns: 2fr 1fr; gap: 12px;">')
+    parts.append(f'<div><label>Cuez Host<input name="cuez_host" id="cuez-to-cueit-host" value="{cuez_to_cueit_cuez_host}" placeholder="localhost or IP address" autocomplete="off" /></label></div>')
+    parts.append(f'<div><label>Cuez Port<input name="cuez_port" id="cuez-to-cueit-port" type="number" value="{cuez_to_cueit_cuez_port}" placeholder="7070" autocomplete="off" /></label></div>')
+    parts.append('</div>')
+    parts.append('</div>')
+
+    # Configuration form
+    parts.append('<form id="cuez-to-cueit-form" style="margin-top: 16px;">')
+    parts.append('<div style="display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 12px; margin-bottom: 12px;">')
+    parts.append('<div style="position: relative;"><label>Output File Path<div style="display: flex; gap: 8px;"><input name="output_path" id="cuez-to-cueit-output-path" value="' + cuez_to_cueit_output_path + '" placeholder="C:\\CueiT\\Import\\cuez_live.rtf" autocomplete="off" style="flex: 1;" /><button type="button" onclick="browseCuezToCueitOutputPath()" style="padding: 8px 12px; background: #3d3d3d; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 12px; white-space: nowrap;">Browse...</button></div></label></div>')
+    parts.append('<div><label>Format<select name="format" id="cuez-to-cueit-format">')
+    parts.append(f'<option value="rtf" {"selected" if CONFIG.cuez_to_cueit_format == "rtf" else ""}>RTF (Recommended)</option>')
+    parts.append(f'<option value="txt" {"selected" if CONFIG.cuez_to_cueit_format == "txt" else ""}>Plain Text</option>')
+    parts.append('</select></label></div>')
+    parts.append(f'<div><label>Poll Interval (seconds)<input name="poll_interval" type="number" value="{cuez_to_cueit_poll_interval}" min="1" max="30" /></label></div>')
+    parts.append('</div>')
+    parts.append('</form>')
+
+    # Auto-sync toggle
+    parts.append('<div style="margin-top: 16px; display: flex; align-items: center; gap: 12px;">')
+    parts.append('<span style="font-size: 14px;">Auto-Sync (automatically sync when script changes)</span>')
+    parts.append('<label class="toggle-switch"><input type="checkbox" id="cuez-to-cueit-auto-sync" ' + cuez_to_cueit_auto_sync + ' onchange="toggleCuezToCueitAutoSync()" /><span class="toggle-slider"></span></label>')
+    parts.append('</div>')
+
+    # Action buttons and status
+    parts.append('<div class="btn-row" style="margin-top: 16px;">')
+    parts.append('<button type="button" onclick="saveCuezToCueitConfig()">Save Configuration</button>')
+    parts.append('<button type="button" class="secondary" onclick="syncCuezToCueitNow()">Sync Now</button>')
+    parts.append('<span id="cuez-to-cueit-status" class="status idle">Not synced yet</span>')
+    parts.append('</div>')
+
+    # Current status display
+    parts.append('<div style="margin-top: 20px; padding: 16px; background: #1e1e1e; border-radius: 6px; border: 1px solid #3d3d3d;">')
+    parts.append('<h4 style="margin: 0 0 12px 0; font-size: 14px; font-weight: 600;">Current Status</h4>')
+    parts.append('<div id="cuez-to-cueit-current-status" style="font-size: 13px; color: #888;">')
+    parts.append('<p style="margin: 4px 0;">Episode: <span id="status-episode">-</span></p>')
+    parts.append('<p style="margin: 4px 0;">Stories: <span id="status-stories">-</span></p>')
+    parts.append('<p style="margin: 4px 0;">Worker: <span id="status-worker">-</span></p>')
+    parts.append('<p style="margin: 4px 0;">File: <span id="status-file" style="font-family: monospace; font-size: 11px;">-</span></p>')
+    parts.append('</div>')
+    parts.append('</div>')
+
+    # How it works section
+    parts.append('<div style="margin-top: 20px; padding: 16px; background: #1a2332; border-radius: 6px; border-left: 4px solid #00bcd4;">')
+    parts.append('<h4 style="margin: 0 0 8px 0; font-size: 14px; font-weight: 600; color: #00bcd4;">How It Works</h4>')
+    parts.append('<ol style="margin: 8px 0 0 0; padding-left: 20px; font-size: 12px; color: #8b949e; line-height: 1.6;">')
+    parts.append('<li>Enable the module and configure the output file path</li>')
+    parts.append('<li>In CueiT, open the output file (e.g., C:\\CueiT\\Import\\cuez_live.rtf)</li>')
+    parts.append('<li>Enable Auto-Sync to start monitoring Cuez Automator</li>')
+    parts.append('<li>When you change episodes or edit stories in Cuez, the file updates automatically</li>')
+    parts.append('<li>CueiT detects the file change and reloads the script - no manual action needed!</li>')
+    parts.append('</ol>')
+    parts.append('</div>')
+
+    parts.append('</div>')  # Close cuez-to-cueit-content
+    parts.append('</fieldset>')  # Close Cuez-to-CueiT fieldset
+
     # JavaScript - use a list and join with newlines
     js_lines = [
         "<script>",
@@ -3927,6 +4352,139 @@ def modules_page(request: Request):
         '  status.textContent = "";',
         '  status.className = "status idle";',
         "}",
+        "",
+        "// ========== CUEZ-TO-CUEIT FUNCTIONS ==========",
+        "",
+        "async function toggleCuezToCueitModule() {",
+        '  const enabled = document.getElementById("cuez-to-cueit-enabled").checked;',
+        '  const content = document.getElementById("cuez-to-cueit-content");',
+        '  await postJSON("/config/module/cuez-to-cueit", { enabled });',
+        '  content.style.display = enabled ? "block" : "none";',
+        "  if (enabled) { refreshCuezToCueitStatus(); }",
+        "}",
+        "",
+        "async function toggleCuezToCueitAutoSync() {",
+        '  const enabled = document.getElementById("cuez-to-cueit-auto-sync").checked;',
+        '  const endpoint = enabled ? "/cuez-to-cueit/sync/enable" : "/cuez-to-cueit/sync/disable";',
+        "  try {",
+        '    const res = await fetch(endpoint, { method: "POST" });',
+        "    const data = await res.json();",
+        "    if (data.ok) {",
+        "      refreshCuezToCueitStatus();",
+        "    }",
+        "  } catch (e) {",
+        '    console.error("Failed to toggle auto-sync:", e);',
+        "  }",
+        "}",
+        "",
+        "async function browseCuezToCueitOutputPath() {",
+        "  // Create a file input element",
+        "  const input = document.createElement('input');",
+        "  input.type = 'file';",
+        "  input.accept = '.rtf,.txt';",
+        "  ",
+        "  input.onchange = (e) => {",
+        "    const file = e.target.files[0];",
+        "    if (file) {",
+        "      // Get the full path (note: in browsers, we can only get the filename for security)",
+        "      // For Electron/desktop apps, you'd use a native file dialog",
+        "      const pathInput = document.getElementById('cuez-to-cueit-output-path');",
+        "      // Since we can't get full path in browser, just use the filename as a guide",
+        "      const currentPath = pathInput.value;",
+        "      const directory = currentPath.substring(0, currentPath.lastIndexOf('\\\\') + 1);",
+        "      pathInput.value = directory + file.name;",
+        "    }",
+        "  };",
+        "  ",
+        "  input.click();",
+        "}",
+        "",
+        "async function saveCuezToCueitConfig() {",
+        '  const form = document.getElementById("cuez-to-cueit-form");',
+        '  const status = document.getElementById("cuez-to-cueit-status");',
+        "  const formData = new FormData(form);",
+        "",
+        "  const config = {",
+        '    cuez_host: document.getElementById("cuez-to-cueit-host").value,',
+        '    cuez_port: parseInt(document.getElementById("cuez-to-cueit-port").value),',
+        '    output_path: formData.get("output_path"),',
+        '    format: formData.get("format"),',
+        '    poll_interval: parseInt(formData.get("poll_interval")),',
+        "  };",
+        "",
+        "  try {",
+        '    status.textContent = "Saving...";',
+        '    status.className = "status";',
+        "",
+        '    const res = await postJSON("/cuez-to-cueit/config", config);',
+        "",
+        "    if (res.ok) {",
+        '      status.textContent = "Configuration saved";',
+        '      status.className = "status success";',
+        "      setTimeout(() => { status.className = 'status idle'; status.textContent = ''; }, 3000);",
+        "    } else {",
+        '      status.textContent = "Error: " + (res.error || "Unknown error");',
+        '      status.className = "status error";',
+        "    }",
+        "  } catch (e) {",
+        '    status.textContent = "Error: " + e.message;',
+        '    status.className = "status error";',
+        "  }",
+        "}",
+        "",
+        "async function syncCuezToCueitNow() {",
+        '  const status = document.getElementById("cuez-to-cueit-status");',
+        "",
+        "  try {",
+        '    status.textContent = "Syncing...";',
+        '    status.className = "status";',
+        "",
+        '    const res = await fetch("/cuez-to-cueit/sync/now", { method: "POST" });',
+        "    const data = await res.json();",
+        "",
+        "    if (data.ok) {",
+        "      if (data.changed) {",
+        '        status.textContent = `Synced ${data.stories} stories from "${data.episode}"`;',
+        '        status.className = "status success";',
+        "      } else {",
+        '        status.textContent = "No changes detected";',
+        '        status.className = "status success";',
+        "      }",
+        "      setTimeout(() => { status.className = 'status idle'; status.textContent = ''; }, 5000);",
+        "      refreshCuezToCueitStatus();",
+        "    } else {",
+        '      status.textContent = "Error: " + (data.error || "Unknown error");',
+        '      status.className = "status error";',
+        "    }",
+        "  } catch (e) {",
+        '    status.textContent = "Error: " + e.message;',
+        '    status.className = "status error";',
+        "  }",
+        "}",
+        "",
+        "async function refreshCuezToCueitStatus() {",
+        "  try {",
+        '    const res = await fetch("/cuez-to-cueit/status");',
+        "    const data = await res.json();",
+        "",
+        "    if (data.ok) {",
+        '      document.getElementById("status-episode").textContent = data.episode_name || "-";',
+        '      document.getElementById("status-stories").textContent = data.story_count || "-";',
+        '      document.getElementById("status-worker").textContent = data.worker_running ? "Running" : "Stopped";',
+        '      document.getElementById("status-file").textContent = data.output_path || "-";',
+        "    }",
+        "  } catch (e) {",
+        '    console.error("Failed to refresh status:", e);',
+        "  }",
+        "}",
+        "",
+        "// Refresh Cuez-to-CueiT status every 5 seconds if module is enabled",
+        "setInterval(() => {",
+        '  const enabled = document.getElementById("cuez-to-cueit-enabled");',
+        "  if (enabled && enabled.checked) {",
+        "    refreshCuezToCueitStatus();",
+        "  }",
+        "}, 5000);",
     ]
     parts.append("\n".join(js_lines))
 
@@ -4333,6 +4891,172 @@ def inews_control_standalone(request: Request):
     parts.append("  document.getElementById('output').value = '';")
     parts.append("  document.getElementById('status').className = 'status';")
     parts.append("}")
+    parts.append("</script>")
+    parts.append("</body></html>")
+    return HTMLResponse("".join(parts))
+
+
+@app.get("/cuez-to-cueit/control", response_class=HTMLResponse)
+def cuez_to_cueit_control_standalone(request: Request):
+    """Standalone Cuez-to-CueiT Bridge control page."""
+    base_url = _base_url(request)
+    parts = ["<!DOCTYPE html><html><head><title>Cuez to CueiT Bridge</title>"]
+    parts.append('<link rel="icon" href="/static/favicon.ico">')
+    parts.append('<link rel="icon" type="image/png" href="/static/esc_icon.png">')
+    parts.append("<style>")
+    # Load ITV Reem font
+    parts.append("@font-face { font-family: 'ITVReem'; src: url('/static/ITV Reem-Regular.ttf') format('truetype'); font-weight: 400; }")
+    parts.append("@font-face { font-family: 'ITVReem'; src: url('/static/ITV Reem-Medium.ttf') format('truetype'); font-weight: 500; }")
+    parts.append("@font-face { font-family: 'ITVReem'; src: url('/static/ITV Reem-Bold.ttf') format('truetype'); font-weight: 700; }")
+    # Base styles
+    parts.append("* { box-sizing: border-box; margin: 0; padding: 0; }")
+    parts.append("body { font-family: 'ITVReem', -apple-system, sans-serif; background: #1a1a1a; color: #fff; padding: 30px; min-height: 100vh; }")
+    parts.append(".container { max-width: 800px; margin: 0 auto; }")
+    parts.append(".header { text-align: center; margin-bottom: 30px; padding-bottom: 20px; border-bottom: 1px solid #3d3d3d; }")
+    parts.append(".header h1 { font-size: 28px; font-weight: 600; margin-bottom: 8px; }")
+    parts.append(".header p { color: #888; font-size: 14px; }")
+    parts.append(".card { background: #252525; border: 1px solid #3d3d3d; border-radius: 8px; padding: 24px; margin-bottom: 20px; }")
+    parts.append(".card h2 { font-size: 18px; font-weight: 600; margin-bottom: 16px; color: #00bcd4; }")
+    parts.append(".status-grid { display: grid; grid-template-columns: auto 1fr; gap: 12px 16px; font-size: 14px; }")
+    parts.append(".status-label { color: #888; }")
+    parts.append(".status-value { font-weight: 500; font-family: monospace; }")
+    parts.append(".button-row { display: flex; gap: 12px; justify-content: center; margin-top: 24px; }")
+    parts.append("button { padding: 14px 28px; background: #00bcd4; color: #fff; border: none; border-radius: 6px; font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.2s; font-family: 'ITVReem', sans-serif; }")
+    parts.append("button:hover { background: #0097a7; transform: translateY(-1px); }")
+    parts.append("button.secondary { background: #3d3d3d; }")
+    parts.append("button.secondary:hover { background: #4d4d4d; }")
+    parts.append(".toggle-switch { position: relative; display: inline-block; width: 50px; height: 28px; }")
+    parts.append(".toggle-switch input { opacity: 0; width: 0; height: 0; }")
+    parts.append(".toggle-slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background: #3d3d3d; border-radius: 28px; transition: 0.3s; }")
+    parts.append(".toggle-slider:before { position: absolute; content: ''; height: 20px; width: 20px; left: 4px; bottom: 4px; background: white; border-radius: 50%; transition: 0.3s; }")
+    parts.append(".toggle-switch input:checked + .toggle-slider { background: #00bcd4; }")
+    parts.append(".toggle-switch input:checked + .toggle-slider:before { transform: translateX(22px); }")
+    parts.append(".toggle-row { display: flex; align-items: center; gap: 16px; margin-top: 20px; padding-top: 20px; border-top: 1px solid #3d3d3d; }")
+    parts.append(".status-message { margin-top: 16px; padding: 12px; border-radius: 6px; text-align: center; font-size: 14px; display: none; }")
+    parts.append(".status-message.success { background: #1b5e20; color: #4caf50; display: block; }")
+    parts.append(".status-message.error { background: #b71c1c; color: #ef5350; display: block; }")
+    parts.append(".status-message.info { background: #1a237e; color: #64b5f6; display: block; }")
+    parts.append(".info-box { background: #1a2332; border-left: 4px solid #00bcd4; padding: 16px; border-radius: 6px; margin-top: 20px; }")
+    parts.append(".info-box h3 { font-size: 14px; font-weight: 600; color: #00bcd4; margin-bottom: 12px; }")
+    parts.append(".info-box ol { margin-left: 20px; font-size: 13px; color: #8b949e; line-height: 1.8; }")
+    parts.append("</style>")
+    parts.append("</head><body>")
+
+    # Header
+    parts.append('<div class="container">')
+    parts.append('<div class="header">')
+    parts.append('<h1>Cuez → CueiT Bridge</h1>')
+    parts.append('<p>Automatically sync scripts from Cuez Automator to CueiT Prompter</p>')
+    parts.append('</div>')
+
+    # Status Card
+    parts.append('<div class="card">')
+    parts.append('<h2>Current Status</h2>')
+    parts.append('<div class="status-grid">')
+    parts.append('<span class="status-label">Episode:</span><span class="status-value" id="episode">Loading...</span>')
+    parts.append('<span class="status-label">Stories:</span><span class="status-value" id="stories">-</span>')
+    parts.append('<span class="status-label">Worker:</span><span class="status-value" id="worker">-</span>')
+    parts.append('<span class="status-label">Output File:</span><span class="status-value" id="output-file" style="font-size: 11px;">-</span>')
+    parts.append('</div>')
+
+    # Auto-sync toggle
+    parts.append('<div class="toggle-row">')
+    parts.append('<span style="font-size: 15px; font-weight: 500;">Auto-Sync</span>')
+    parts.append('<label class="toggle-switch"><input type="checkbox" id="auto-sync-toggle" onchange="toggleAutoSync()"><span class="toggle-slider"></span></label>')
+    parts.append('<span style="font-size: 13px; color: #888;">Automatically monitor Cuez for changes</span>')
+    parts.append('</div>')
+    parts.append('</div>')
+
+    # Manual Sync Button
+    parts.append('<div class="button-row">')
+    parts.append('<button onclick="syncNow()">Sync Now</button>')
+    parts.append('<button class="secondary" onclick="refreshStatus()">Refresh Status</button>')
+    parts.append('</div>')
+
+    # Status message
+    parts.append('<div id="status" class="status-message"></div>')
+
+    # How it works
+    parts.append('<div class="info-box">')
+    parts.append('<h3>How It Works</h3>')
+    parts.append('<ol>')
+    parts.append('<li>The bridge monitors the Cuez Automator API for script changes</li>')
+    parts.append('<li>When a change is detected, it formats the script with CueiT sluglines ([#] format)</li>')
+    parts.append('<li>The formatted script is saved to the configured output file</li>')
+    parts.append('<li>CueiT detects the file modification and automatically reloads the script</li>')
+    parts.append('<li>No manual intervention needed - just enable Auto-Sync!</li>')
+    parts.append('</ol>')
+    parts.append('</div>')
+
+    parts.append('</div>')  # End container
+
+    # JavaScript
+    parts.append("<script>")
+    parts.append("async function refreshStatus() {")
+    parts.append("  try {")
+    parts.append("    const res = await fetch('/cuez-to-cueit/status');")
+    parts.append("    const data = await res.json();")
+    parts.append("    if (data.ok) {")
+    parts.append("      document.getElementById('episode').textContent = data.episode_name || '-';")
+    parts.append("      document.getElementById('stories').textContent = data.story_count || '-';")
+    parts.append("      document.getElementById('worker').textContent = data.worker_running ? 'Running ✓' : 'Stopped';")
+    parts.append("      document.getElementById('output-file').textContent = data.output_path || '-';")
+    parts.append("      document.getElementById('auto-sync-toggle').checked = data.auto_sync_enabled;")
+    parts.append("    }")
+    parts.append("  } catch (e) {")
+    parts.append("    console.error('Failed to refresh status:', e);")
+    parts.append("  }")
+    parts.append("}")
+    parts.append("")
+    parts.append("async function toggleAutoSync() {")
+    parts.append("  const enabled = document.getElementById('auto-sync-toggle').checked;")
+    parts.append("  const endpoint = enabled ? '/cuez-to-cueit/sync/enable' : '/cuez-to-cueit/sync/disable';")
+    parts.append("  const status = document.getElementById('status');")
+    parts.append("  try {")
+    parts.append("    const res = await fetch(endpoint, { method: 'POST' });")
+    parts.append("    const data = await res.json();")
+    parts.append("    if (data.ok) {")
+    parts.append("      status.textContent = enabled ? 'Auto-sync enabled' : 'Auto-sync disabled';")
+    parts.append("      status.className = 'status-message success';")
+    parts.append("      setTimeout(() => status.className = 'status-message', 3000);")
+    parts.append("      refreshStatus();")
+    parts.append("    }")
+    parts.append("  } catch (e) {")
+    parts.append("    status.textContent = 'Error: ' + e.message;")
+    parts.append("    status.className = 'status-message error';")
+    parts.append("  }")
+    parts.append("}")
+    parts.append("")
+    parts.append("async function syncNow() {")
+    parts.append("  const status = document.getElementById('status');")
+    parts.append("  try {")
+    parts.append("    status.textContent = 'Syncing...';")
+    parts.append("    status.className = 'status-message info';")
+    parts.append("    const res = await fetch('/cuez-to-cueit/sync/now', { method: 'POST' });")
+    parts.append("    const data = await res.json();")
+    parts.append("    if (data.ok) {")
+    parts.append("      if (data.changed) {")
+    parts.append("        status.textContent = `Synced ${data.stories} stories from \"${data.episode}\"`;")
+    parts.append("        status.className = 'status-message success';")
+    parts.append("      } else {")
+    parts.append("        status.textContent = 'No changes detected';")
+    parts.append("        status.className = 'status-message info';")
+    parts.append("      }")
+    parts.append("      setTimeout(() => status.className = 'status-message', 5000);")
+    parts.append("      refreshStatus();")
+    parts.append("    } else {")
+    parts.append("      status.textContent = 'Error: ' + (data.error || 'Unknown error');")
+    parts.append("      status.className = 'status-message error';")
+    parts.append("    }")
+    parts.append("  } catch (e) {")
+    parts.append("    status.textContent = 'Error: ' + e.message;")
+    parts.append("    status.className = 'status-message error';")
+    parts.append("  }")
+    parts.append("}")
+    parts.append("")
+    parts.append("// Refresh status on load and every 5 seconds")
+    parts.append("refreshStatus();")
+    parts.append("setInterval(refreshStatus, 5000);")
     parts.append("</script>")
     parts.append("</body></html>")
     return HTMLResponse("".join(parts))
