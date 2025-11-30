@@ -65,7 +65,7 @@ class SingularTweaksGUI:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title(f"Elliott's Singular Controls - v{_runtime_version()}")
-        self.root.geometry("750x600")
+        self.root.geometry("750x650")
         self.root.resizable(False, False)  # Fixed size window
 
         # Modern dark theme colors (dark gray, not pure black)

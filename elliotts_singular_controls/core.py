@@ -2250,6 +2250,127 @@ def singular_control(items: List[SingularItem], app_name: Optional[str] = Query(
     return {"status": r.status_code, "response": r.text}
 
 
+@app.get("/singular/counter/control")
+def singular_counter_control(
+    control_node_id: str = Query(..., description="Control node ID of the counter"),
+    action: str = Query(..., description="Action: 'increment', 'decrement', or 'set'"),
+    value: Optional[int] = Query(None, description="Value to set (only for 'set' action)"),
+    subcomposition_name: Optional[str] = Query(None, description="Subcomposition name (optional)"),
+    subcomposition_id: Optional[str] = Query(None, description="Subcomposition ID (optional)"),
+    app_name: Optional[str] = Query(None, description="App name to send to (optional)")
+):
+    """Control a counter node in Singular (increment, decrement, or set value)."""
+    # Get the token
+    if app_name and app_name in CONFIG.singular_tokens:
+        token = CONFIG.singular_tokens[app_name]
+    elif CONFIG.singular_tokens:
+        token = list(CONFIG.singular_tokens.values())[0]
+    else:
+        raise HTTPException(400, "No Singular control app tokens configured")
+
+    url = f"{SINGULAR_API_BASE}/controlapps/{token}/control"
+
+    # For increment/decrement, we need to read current value first
+    if action in ("increment", "decrement"):
+        try:
+            # GET current payload
+            get_resp = requests.get(url, timeout=10)
+            get_resp.raise_for_status()
+            current_data = get_resp.json()
+
+            # Find the subcomposition and get current counter value
+            current_value = None
+            target_subcomp_id = subcomposition_id
+
+            for subcomp in current_data:
+                if subcomposition_name and subcomp.get("subCompositionName") == subcomposition_name:
+                    target_subcomp_id = subcomp.get("subCompositionId")
+                    current_value = subcomp.get("payload", {}).get(control_node_id)
+                    break
+                elif subcomposition_id and subcomp.get("subCompositionId") == subcomposition_id:
+                    current_value = subcomp.get("payload", {}).get(control_node_id)
+                    break
+
+            if current_value is None:
+                current_value = 1  # Default if not found
+
+            # Calculate new value
+            new_value = int(current_value) + (1 if action == "increment" else -1)
+
+        except Exception as e:
+            raise HTTPException(500, f"Failed to read current counter value: {str(e)}")
+    else:
+        # For 'set' action, use provided value
+        if value is None:
+            raise HTTPException(400, "Value parameter required for 'set' action")
+        new_value = value
+        target_subcomp_id = subcomposition_id
+
+    # Build payload with new value
+    payload_item = {"payload": {control_node_id: new_value}}
+
+    if target_subcomp_id:
+        payload_item["subCompositionId"] = target_subcomp_id
+    elif subcomposition_name:
+        payload_item["subCompositionName"] = subcomposition_name
+    else:
+        raise HTTPException(400, "Either subcomposition_name or subcomposition_id must be provided")
+
+    # Send the PATCH request with new value
+    body = [payload_item]
+
+    try:
+        resp = requests.patch(url, json=body, timeout=10)
+        resp.raise_for_status()
+        result = resp.json() if resp.text else {"success": True}
+        log_event("Counter", f"{action}: {control_node_id} = {new_value} in {subcomposition_name or target_subcomp_id}")
+        return {"ok": True, "action": action, "old_value": current_value if action != "set" else None, "new_value": new_value, "result": result}
+    except requests.RequestException as e:
+        log_event("Counter Error", str(e))
+        raise HTTPException(500, f"Failed to control counter: {str(e)}")
+
+
+@app.get("/singular/button/execute")
+def singular_button_execute(
+    control_node_id: str = Query(..., description="Control node ID of the button"),
+    subcomposition_name: Optional[str] = Query(None, description="Subcomposition name (optional)"),
+    subcomposition_id: Optional[str] = Query(None, description="Subcomposition ID (optional)"),
+    app_name: Optional[str] = Query(None, description="App name to send to (optional)")
+):
+    """Execute/trigger a button control node in Singular."""
+    # Get the token
+    if app_name and app_name in CONFIG.singular_tokens:
+        token = CONFIG.singular_tokens[app_name]
+    elif CONFIG.singular_tokens:
+        token = list(CONFIG.singular_tokens.values())[0]
+    else:
+        raise HTTPException(400, "No Singular control app tokens configured")
+
+    # Build the payload
+    payload_item = {"payload": {control_node_id: "execute"}}
+
+    if subcomposition_id:
+        payload_item["subCompositionId"] = subcomposition_id
+    elif subcomposition_name:
+        payload_item["subCompositionName"] = subcomposition_name
+    else:
+        raise HTTPException(400, "Either subcomposition_name or subcomposition_id must be provided")
+
+    # Send the request
+    url = f"{SINGULAR_API_BASE}/controlapps/{token}/control"
+    body = [payload_item]
+
+    try:
+        resp = requests.patch(url, json=body, timeout=10)
+        resp.raise_for_status()
+        result = resp.json() if resp.text else {"success": True}
+        log_event("Button", f"executed: {control_node_id} in {subcomposition_name or subcomposition_id}")
+        return {"ok": True, "result": result}
+    except requests.RequestException as e:
+        log_event("Button Error", str(e))
+        raise HTTPException(500, f"Failed to execute button: {str(e)}")
+
+
 @app.get("/singular/list")
 def singular_list():
     result = {}
@@ -2271,19 +2392,64 @@ def singular_refresh():
     return {"ok": True, "count": total, "apps": len(REGISTRY)}
 
 
-def _field_examples(base: str, key: str, field_id: str, field_meta: dict):
+def _field_examples(base: str, key: str, field_id: str, field_meta: dict, subcomp_name: str):
     ftype = (field_meta.get("type") or "").lower()
     examples: Dict[str, str] = {}
     set_url = f"{base}/{key}/set?field={quote(field_id)}&value=VALUE"
     examples["set_url"] = set_url
+    examples["field_type"] = ftype
+
+    # Add type-specific examples and quick actions
     if ftype == "timecontrol":
         start = f"{base}/{key}/timecontrol?field={quote(field_id)}&run=true&value=0"
         stop = f"{base}/{key}/timecontrol?field={quote(field_id)}&run=false&value=0"
+        reset = f"{base}/{key}/timecontrol?field={quote(field_id)}&run=false&value=0"
         examples["timecontrol_start_url"] = start
         examples["timecontrol_stop_url"] = stop
+        examples["timecontrol_reset_url"] = reset
         examples["start_10s_if_supported"] = (
             f"{base}/{key}/timecontrol?field={quote(field_id)}&run=true&value=0&seconds=10"
         )
+    elif ftype == "counter":
+        # Counter with increment/decrement
+        examples["counter_increment_url"] = f"{base.replace('/singular', '')}/singular/counter/control?control_node_id={quote(field_id)}&action=increment&subcomposition_name={quote(subcomp_name)}"
+        examples["counter_decrement_url"] = f"{base.replace('/singular', '')}/singular/counter/control?control_node_id={quote(field_id)}&action=decrement&subcomposition_name={quote(subcomp_name)}"
+        examples["counter_set_url"] = f"{base.replace('/singular', '')}/singular/counter/control?control_node_id={quote(field_id)}&action=set&value=VALUE&subcomposition_name={quote(subcomp_name)}"
+    elif ftype == "button":
+        # Button execute
+        examples["button_execute_url"] = f"{base.replace('/singular', '')}/singular/button/execute?control_node_id={quote(field_id)}&subcomposition_name={quote(subcomp_name)}"
+    elif ftype == "checkbox":
+        # Checkbox on/off
+        examples["checkbox_on_url"] = f"{base}/{key}/set?field={quote(field_id)}&value=true"
+        examples["checkbox_off_url"] = f"{base}/{key}/set?field={quote(field_id)}&value=false"
+        examples["checkbox_toggle_note"] = "Use true/false values"
+    elif ftype == "color":
+        # Color examples
+        examples["color_example_hex"] = f"{base}/{key}/set?field={quote(field_id)}&value=%2333AAFF"
+        examples["color_example_rgba"] = f"{base}/{key}/set?field={quote(field_id)}&value=rgba(255,150,150,0.5)"
+        examples["color_example_name"] = f"{base}/{key}/set?field={quote(field_id)}&value=lightgray"
+    elif ftype == "selection":
+        # Selection - show available options if metadata includes them
+        options = field_meta.get("options", [])
+        if options:
+            examples["selection_options"] = options
+            if options:
+                examples["selection_example"] = f"{base}/{key}/set?field={quote(field_id)}&value={quote(str(options[0]))}"
+    elif ftype == "image":
+        # Image URL
+        examples["image_example"] = f"{base}/{key}/set?field={quote(field_id)}&value=https://example.com/image.png"
+    elif ftype == "audio":
+        # Audio URL
+        examples["audio_example"] = f"{base}/{key}/set?field={quote(field_id)}&value=https://example.com/audio.mp3"
+    elif ftype in ("number", "normalizednumber"):
+        # Number fields - show min/max if available
+        min_val = field_meta.get("min")
+        max_val = field_meta.get("max")
+        if min_val is not None:
+            examples["number_min"] = min_val
+        if max_val is not None:
+            examples["number_max"] = max_val
+
     return examples
 
 
@@ -2307,7 +2473,7 @@ def singular_commands(request: Request):
             for fid, fmeta in meta["fields"].items():
                 if not fid:
                     continue
-                entry["fields"][fid] = _field_examples(base, f"{app_name}/{key}", fid, fmeta)
+                entry["fields"][fid] = _field_examples(base, f"{app_name}/{key}", fid, fmeta, meta["name"])
             catalog[full_key] = entry
     return {
         "note": "Most control endpoints support GET for testing, but POST is recommended in automation.",
@@ -2332,7 +2498,7 @@ def singular_commands_for_one(app_name: str, key: str, request: Request):
     for fid, fmeta in meta["fields"].items():
         if not fid:
             continue
-        entry["fields"][fid] = _field_examples(base, f"{found_app}/{k}", fid, fmeta)
+        entry["fields"][fid] = _field_examples(base, f"{found_app}/{k}", fid, fmeta, meta["name"])
     return {"commands": entry}
 
 
@@ -2426,7 +2592,7 @@ def index():
     parts.append("  .app-list { margin: 12px 0; }")
     parts.append("  .app-item { display: flex; align-items: center; gap: 8px; padding: 12px; background: #1a1a1a; border: 1px solid #3d3d3d; border-radius: 8px; margin-bottom: 8px; }")
     parts.append("  .app-item .app-name { font-weight: 600; font-size: 14px; min-width: 70px; }")
-    parts.append("  .app-item .app-token { flex: 1; font-family: 'SF Mono', Monaco, Consolas, monospace; font-size: 11px; color: #888; background: #252525; padding: 0 12px; height: 32px; line-height: 32px; border-radius: 6px; border: 1px solid #3d3d3d; overflow-x: auto; white-space: nowrap; }")
+    parts.append("  .app-item .app-token { flex: 1; font-family: 'SF Mono', Monaco, Consolas, monospace; font-size: 11px; color: #888; background: #252525; padding: 0 12px; height: 32px; line-height: 32px; border-radius: 6px; border: 1px solid #3d3d3d; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }")
     parts.append("  .app-item .app-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-shrink: 0; }")
     parts.append("  .app-item .app-status { height: 32px; min-width: 75px; padding: 0 10px; border-radius: 6px; font-size: 12px; font-weight: 500; display: inline-flex; align-items: center; justify-content: center; }")
     parts.append("  .app-item .app-status.ok { background: #22c55e; color: #fff; }")
@@ -2435,7 +2601,7 @@ def index():
     parts.append("  .app-item button { height: 32px; padding: 0 14px; font-size: 12px; margin: 0 !important; }")
     parts.append("  .add-app-form { display: flex; gap: 8px; align-items: flex-end; margin-top: 16px; padding-top: 16px; border-top: 1px solid #3d3d3d; }")
     parts.append("  .add-app-form label { margin: 0; font-size: 12px; }")
-    parts.append("  .add-app-form input { margin-top: 4px; height: 32px; }")
+    parts.append("  .add-app-form input { margin-top: 4px; height: 32px; overflow: hidden !important; resize: none !important; box-sizing: border-box !important; }")
     parts.append("  .add-app-form button { height: 32px; margin: 0 !important; }")
     parts.append("</style>")
     parts.append("</head><body>")
@@ -2448,7 +2614,7 @@ def index():
     parts.append('<div id="app-list" class="app-list"><p style="color: #888;">Loading...</p></div>')
     parts.append('<div class="add-app-form">')
     parts.append('<label>App Name <input type="text" id="new-app-name" placeholder="e.g. Main Show" style="width: 150px;" /></label>')
-    parts.append('<label style="flex: 1;">Token <input type="text" id="new-app-token" placeholder="Paste Control App Token" style="width: 100%;" /></label>')
+    parts.append('<label style="flex: 1;">Token <input type="text" id="new-app-token" placeholder="Paste Control App Token" style="width: 100%; overflow: hidden !important; box-sizing: border-box !important;" /></label>')
     parts.append('<button type="button" id="btn-add">Add App</button>')
     parts.append('<button type="button" id="btn-ping-all" class="secondary">Ping All</button>')
     parts.append('</div>')
@@ -4353,8 +4519,9 @@ def commands_page(request: Request):
     parts.append("  .value-input { width: 100%; padding: 6px 10px; border: 1px solid #30363d; border-radius: 4px; background: #21262d; color: #e6edf3; font-size: 13px; box-sizing: border-box; }")
     parts.append("  .value-input:focus { outline: none; border-color: #00bcd4; box-shadow: 0 0 0 2px rgba(0,188,212,0.2); }")
     parts.append("  .value-input::placeholder { color: #666; }")
-    parts.append("  button.play-btn { background: #238636; border: none; color: #fff; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 14px; }")
-    parts.append("  button.play-btn:hover { background: #2ea043; }")
+    parts.append("  button.play-btn, a.play-btn { background: #00bcd4; border: none; color: #fff; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 14px; text-decoration: none; display: inline-block; transition: all 0.2s; }")
+    parts.append("  button.play-btn:hover, a.play-btn:hover { background: #0097a7; }")
+    parts.append("  button.play-btn:active, a.play-btn:active { background: #00838f; transform: scale(0.95); }")
     parts.append("</style>")
     parts.append("</head><body>")
     parts.append(_nav_html("Commands"))
@@ -4397,9 +4564,9 @@ def commands_page(request: Request):
     parts.append("    html += '<h3>' + item.name + appBadge + ' <small style=\"color:#888;\">(' + key + ')</small></h3>';")
     parts.append("    html += '<table><tr><th>Action</th><th>GET URL</th><th style=\"width:60px;text-align:center;\">Test</th></tr>';")
     parts.append("    html += '<tr><td>IN</td><td><code class=\"copyable\" onclick=\"copyToClipboard(this)\" title=\"Click to copy\">' + item.in_url + '</code></td>' +")
-    parts.append("            '<td style=\"text-align:center;\"><a href=\"' + item.in_url + '\" target=\"_blank\" class=\"play-btn\" title=\"Test IN\">▶</a></td></tr>';")
+    parts.append("            '<td style=\"text-align:center;\"><button class=\"play-btn\" onclick=\"fireCommand(\\'' + item.in_url + '\\', this)\" title=\"Test IN\">▶</button></td></tr>';")
     parts.append("    html += '<tr><td>OUT</td><td><code class=\"copyable\" onclick=\"copyToClipboard(this)\" title=\"Click to copy\">' + item.out_url + '</code></td>' +")
-    parts.append("            '<td style=\"text-align:center;\"><a href=\"' + item.out_url + '\" target=\"_blank\" class=\"play-btn\" title=\"Test OUT\">▶</a></td></tr>';")
+    parts.append("            '<td style=\"text-align:center;\"><button class=\"play-btn\" onclick=\"fireCommand(\\'' + item.out_url + '\\', this)\" title=\"Test OUT\">▶</button></td></tr>';")
     parts.append("    html += '</table>';")
     parts.append("    const fields = item.fields || {};")
     parts.append("    const fkeys = Object.keys(fields);")
@@ -4408,18 +4575,63 @@ def commands_page(request: Request):
     parts.append("      html += '<table><tr><th>Field</th><th>Type</th><th>Command URL</th><th style=\"width:200px;\">Test Value</th><th style=\"width:60px;text-align:center;\">Test</th></tr>';")
     parts.append("      for (const fid of fkeys) {")
     parts.append("        const ex = fields[fid];")
-    parts.append("        if (ex.timecontrol_start_url) {")
+    parts.append("        if (ex.counter_increment_url) {")
+    parts.append("          html += '<tr><td rowspan=\"4\">' + fid + '</td><td rowspan=\"4\">🔢 Counter</td>';")
+    parts.append("          html += '<td><code class=\"copyable\" onclick=\"copyToClipboard(this)\" title=\"Click to copy\">' + ex.counter_increment_url + '</code></td>';")
+    parts.append("          html += '<td></td>';")
+    parts.append("          html += '<td style=\"text-align:center;\"><button class=\"play-btn\" onclick=\"fireCommand(\\'' + ex.counter_increment_url + '\\', this)\" title=\"Increment\">+</button></td></tr>';")
+    parts.append("          html += '<tr><td><code class=\"copyable\" onclick=\"copyToClipboard(this)\" title=\"Click to copy\">' + ex.counter_decrement_url + '</code></td>';")
+    parts.append("          html += '<td></td>';")
+    parts.append("          html += '<td style=\"text-align:center;\"><button class=\"play-btn\" onclick=\"fireCommand(\\'' + ex.counter_decrement_url + '\\', this)\" title=\"Decrement\">-</button></td></tr>';")
+    parts.append("          const fieldId = key + '_' + fid + '_counter';")
+    parts.append("          html += '<tr><td><code class=\"copyable\" onclick=\"copyToClipboard(this)\" title=\"Click to copy\">' + ex.counter_set_url + '</code></td>';")
+    parts.append("          html += '<td><input type=\"text\" id=\"val_' + fieldId + '\" class=\"value-input\" placeholder=\"Set value...\" data-base-url=\"' + ex.counter_set_url + '\" /></td>';")
+    parts.append("          html += '<td style=\"text-align:center;\"><button type=\"button\" class=\"play-btn\" onclick=\"testValue(\\'' + fieldId + '\\')\" title=\"Set Value\">▶</button></td></tr>';")
+    parts.append("          html += '<tr><td><code class=\"copyable\" onclick=\"copyToClipboard(this)\" title=\"Click to copy\">' + ex.set_url + '</code></td>';")
+    parts.append("          html += '<td colspan=\"2\" style=\"color:#666;font-size:11px;\">Direct value set (alternative)</td></tr>';")
+    parts.append("        } else if (ex.button_execute_url) {")
+    parts.append("          html += '<tr><td>' + fid + '</td><td>🔘 Button</td>';")
+    parts.append("          html += '<td><code class=\"copyable\" onclick=\"copyToClipboard(this)\" title=\"Click to copy\">' + ex.button_execute_url + '</code></td>';")
+    parts.append("          html += '<td></td>';")
+    parts.append("          html += '<td style=\"text-align:center;\"><button class=\"play-btn\" onclick=\"fireCommand(\\'' + ex.button_execute_url + '\\', this)\" title=\"Execute Button\">▶</button></td></tr>';")
+    parts.append("        } else if (ex.checkbox_on_url) {")
+    parts.append("          html += '<tr><td rowspan=\"2\">' + fid + '</td><td rowspan=\"2\">☑️ Checkbox</td>';")
+    parts.append("          html += '<td><code class=\"copyable\" onclick=\"copyToClipboard(this)\" title=\"Click to copy\">' + ex.checkbox_on_url + '</code></td>';")
+    parts.append("          html += '<td></td>';")
+    parts.append("          html += '<td style=\"text-align:center;\"><button class=\"play-btn\" onclick=\"fireCommand(\\'' + ex.checkbox_on_url + '\\', this)\" title=\"Turn ON\">ON</button></td></tr>';")
+    parts.append("          html += '<tr><td><code class=\"copyable\" onclick=\"copyToClipboard(this)\" title=\"Click to copy\">' + ex.checkbox_off_url + '</code></td>';")
+    parts.append("          html += '<td></td>';")
+    parts.append("          html += '<td style=\"text-align:center;\"><button class=\"play-btn\" onclick=\"fireCommand(\\'' + ex.checkbox_off_url + '\\', this)\" title=\"Turn OFF\">OFF</button></td></tr>';")
+    parts.append("        } else if (ex.color_example_hex) {")
+    parts.append("          html += '<tr><td rowspan=\"3\">' + fid + '</td><td rowspan=\"3\">🎨 Color</td>';")
+    parts.append("          html += '<td><code class=\"copyable\" onclick=\"copyToClipboard(this)\" title=\"Click to copy\">' + ex.color_example_hex + '</code></td>';")
+    parts.append("          html += '<td colspan=\"2\" style=\"color:#666;font-size:11px;\">Hex example</td></tr>';")
+    parts.append("          html += '<tr><td><code class=\"copyable\" onclick=\"copyToClipboard(this)\" title=\"Click to copy\">' + ex.color_example_rgba + '</code></td>';")
+    parts.append("          html += '<td colspan=\"2\" style=\"color:#666;font-size:11px;\">RGBA example</td></tr>';")
+    parts.append("          html += '<tr><td><code class=\"copyable\" onclick=\"copyToClipboard(this)\" title=\"Click to copy\">' + ex.color_example_name + '</code></td>';")
+    parts.append("          html += '<td colspan=\"2\" style=\"color:#666;font-size:11px;\">Named color example</td></tr>';")
+    parts.append("        } else if (ex.selection_options) {")
+    parts.append("          const rowspan = ex.selection_options.length + 1;")
+    parts.append("          html += '<tr><td rowspan=\"' + rowspan + '\">' + fid + '</td><td rowspan=\"' + rowspan + '\">📋 Selection</td>';")
+    parts.append("          html += '<td colspan=\"3\" style=\"color:#888;font-size:11px;\">Available options:</td></tr>';")
+    parts.append("          for (const opt of ex.selection_options) {")
+    parts.append("            const optUrl = ex.set_url.replace('VALUE', encodeURIComponent(opt));")
+    parts.append("            html += '<tr><td><code class=\"copyable\" onclick=\"copyToClipboard(this)\" title=\"Click to copy\">' + optUrl + '</code></td>';")
+    parts.append("            html += '<td style=\"color:#00bcd4;\">' + opt + '</td>';")
+    parts.append("            html += '<td style=\"text-align:center;\"><button class=\"play-btn\" onclick=\"fireCommand(\\'' + optUrl + '\\', this)\" title=\"Select ' + opt + '\">▶</button></td></tr>';")
+    parts.append("          }")
+    parts.append("        } else if (ex.timecontrol_start_url) {")
     parts.append("          html += '<tr><td rowspan=\"3\">' + fid + '</td><td rowspan=\"3\">⏱ Timer</td>';")
     parts.append("          html += '<td><code class=\"copyable\" onclick=\"copyToClipboard(this)\" title=\"Click to copy\">' + ex.timecontrol_start_url + '</code></td>';")
     parts.append("          html += '<td></td>';")
-    parts.append("          html += '<td style=\"text-align:center;\"><a href=\"' + ex.timecontrol_start_url + '\" target=\"_blank\" class=\"play-btn\" title=\"Start Timer\">▶</a></td></tr>';")
+    parts.append("          html += '<td style=\"text-align:center;\"><button class=\"play-btn\" onclick=\"fireCommand(\\'' + ex.timecontrol_start_url + '\\', this)\" title=\"Start Timer\">▶</button></td></tr>';")
     parts.append("          html += '<tr><td><code class=\"copyable\" onclick=\"copyToClipboard(this)\" title=\"Click to copy\">' + ex.timecontrol_stop_url + '</code></td>';")
     parts.append("          html += '<td></td>';")
-    parts.append("          html += '<td style=\"text-align:center;\"><a href=\"' + ex.timecontrol_stop_url + '\" target=\"_blank\" class=\"play-btn\" title=\"Stop Timer\">▶</a></td></tr>';")
+    parts.append("          html += '<td style=\"text-align:center;\"><button class=\"play-btn\" onclick=\"fireCommand(\\'' + ex.timecontrol_stop_url + '\\', this)\" title=\"Stop Timer\">▶</button></td></tr>';")
     parts.append("          if (ex.start_10s_if_supported) {")
     parts.append("            html += '<tr><td><code class=\"copyable\" onclick=\"copyToClipboard(this)\" title=\"Click to copy\">' + ex.start_10s_if_supported + '</code></td>';")
     parts.append("            html += '<td></td>';")
-    parts.append("            html += '<td style=\"text-align:center;\"><a href=\"' + ex.start_10s_if_supported + '\" target=\"_blank\" class=\"play-btn\" title=\"Start 10s\">▶</a></td></tr>';")
+    parts.append("            html += '<td style=\"text-align:center;\"><button class=\"play-btn\" onclick=\"fireCommand(\\'' + ex.start_10s_if_supported + '\\', this)\" title=\"Start 10s\">▶</button></td></tr>';")
     parts.append("          } else {")
     parts.append("            html += '<tr><td colspan=\"3\" style=\"color:#666;\">Duration param not supported</td></tr>';")
     parts.append("          }")
@@ -4475,6 +4687,28 @@ def commands_page(request: Request):
     parts.append("      el.classList.remove('copied');")
     parts.append("    }, 1500);")
     parts.append("  });")
+    parts.append("}")
+    parts.append("async function fireCommand(url, btnEl) {")
+    parts.append("  const originalText = btnEl.textContent;")
+    parts.append("  const originalBg = btnEl.style.background;")
+    parts.append("  try {")
+    parts.append("    btnEl.textContent = '...';")
+    parts.append("    btnEl.style.background = '#0097a7';")
+    parts.append("    const res = await fetch(url);")
+    parts.append("    if (res.ok) {")
+    parts.append("      btnEl.style.background = '#4caf50';")
+    parts.append("      btnEl.textContent = '✓';")
+    parts.append("      setTimeout(() => { btnEl.textContent = originalText; btnEl.style.background = originalBg; }, 1000);")
+    parts.append("    } else {")
+    parts.append("      btnEl.style.background = '#f44336';")
+    parts.append("      btnEl.textContent = '✗';")
+    parts.append("      setTimeout(() => { btnEl.textContent = originalText; btnEl.style.background = originalBg; }, 2000);")
+    parts.append("    }")
+    parts.append("  } catch (e) {")
+    parts.append("    btnEl.style.background = '#f44336';")
+    parts.append("    btnEl.textContent = '✗';")
+    parts.append("    setTimeout(() => { btnEl.textContent = originalText; btnEl.style.background = originalBg; }, 2000);")
+    parts.append("  }")
     parts.append("}")
     parts.append("async function testValue(fieldId) {")
     parts.append("  const input = document.getElementById('val_' + fieldId);")
