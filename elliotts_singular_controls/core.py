@@ -14,7 +14,7 @@ from datetime import datetime
 
 import requests
 from fastapi import FastAPI, Query, HTTPException, Request, Body
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.routing import APIRoute
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -211,6 +211,7 @@ class AppConfig(BaseModel):
     cuez_port: Optional[int] = None  # No default - user must enter their port
     cuez_cached_buttons: List[Dict[str, Any]] = []  # Cached button list
     cuez_cached_macros: List[Dict[str, Any]] = []  # Cached macro list
+    cuez_custom_views: List[Dict[str, Any]] = []  # Custom filtered views configuration
     # iNews Cleaner module settings
     enable_inews: bool = False
     theme: str = "dark"
@@ -242,6 +243,28 @@ def load_config() -> AppConfig:
         "enable_cuez": False,
         "cuez_host": os.getenv("CUEZ_HOST", "localhost"),
         "cuez_port": int(os.getenv("CUEZ_PORT", "7070")),
+        "cuez_custom_views": [
+            {
+                "name": "Video Blocks",
+                "icon": "🎥",
+                "color": "#ff5722",
+                "filters": {
+                    "include_patterns": ["VT", "VIDEO", "CLIP", "PKG", "ULAY"],
+                    "exclude_patterns": [],
+                    "exclude_scripts": True
+                }
+            },
+            {
+                "name": "Bugs & Straps",
+                "icon": "📌",
+                "color": "#4caf50",
+                "filters": {
+                    "include_patterns": ["BUG", "STRAP", "SUPER", "L3RD", "THIRD"],
+                    "exclude_patterns": [],
+                    "exclude_scripts": True
+                }
+            }
+        ],
         "theme": "dark",
         "port": int(os.getenv("SINGULAR_TWEAKS_PORT")) if os.getenv("SINGULAR_TWEAKS_PORT") else None,
     }
@@ -915,7 +938,14 @@ def cuez_get_blocks() -> Dict[str, Any]:
     """Get all blocks (triggers) in the current rundown."""
     try:
         resp = cuez_request("/api/trigger/blockcontent")
-        return {"ok": True, "blocks": resp.json()}
+        blocks_data = resp.json()
+
+        # Convert list to dict if needed (Cuez API returns a list)
+        if isinstance(blocks_data, list):
+            blocks_dict = {block.get("id", str(i)): block for i, block in enumerate(blocks_data)}
+            return {"ok": True, "blocks": blocks_dict}
+        else:
+            return {"ok": True, "blocks": blocks_data}
     except HTTPException as e:
         return {"ok": False, "error": e.detail}
     except Exception as e:
@@ -1997,6 +2027,107 @@ def cuez_trigger_block_endpoint(block_id: str):
     return cuez_trigger_block(block_id)
 
 
+@app.get("/cuez/blocks/filtered")
+def cuez_blocks_filtered(view_name: Optional[str] = Query(None, description="Custom view name to filter by")):
+    """Get blocks filtered by custom view configuration."""
+    blocks_result = cuez_get_blocks()
+    if not blocks_result.get("ok"):
+        return blocks_result
+
+    all_blocks = blocks_result.get("blocks", {})
+
+    # If no view specified, return all blocks
+    if not view_name:
+        return {"ok": True, "blocks": all_blocks, "view": "all"}
+
+    # Find the view configuration
+    view_config = None
+    for view in CONFIG.cuez_custom_views:
+        if view.get("name") == view_name:
+            view_config = view
+            break
+
+    if not view_config:
+        return {"ok": False, "error": f"View '{view_name}' not found"}
+
+    # Filter blocks based on view patterns
+    filtered_blocks = {}
+    filters = view_config.get("filters", {})
+    include_patterns = [p.upper() for p in filters.get("include_patterns", [])]
+    exclude_patterns = [p.upper() for p in filters.get("exclude_patterns", [])]
+    exclude_scripts = filters.get("exclude_scripts", False)
+
+    for block_id, block_data in all_blocks.items():
+        # Get block name and type
+        name = ""
+        block_type = ""
+        if isinstance(block_data, dict):
+            # Get title/name
+            title_obj = block_data.get("title", {})
+            if isinstance(title_obj, dict):
+                name = title_obj.get("title", "")
+            else:
+                name = str(title_obj)
+            if not name:
+                name = block_data.get("name", "")
+
+            # Get type (e.g., "VIDEO", "BUGS & STRAPS", "SCRIPT")
+            block_type = block_data.get("typeTitle", "")
+
+        name_upper = name.upper()
+        type_upper = block_type.upper()
+
+        # Skip scripts if exclude_scripts is enabled
+        if exclude_scripts and type_upper == "SCRIPT":
+            continue
+
+        # Combine name and type for searching
+        searchable_text = f"{name_upper} {type_upper}"
+
+        # Check if block matches include patterns
+        include_match = False
+        if include_patterns:
+            for pattern in include_patterns:
+                if pattern in searchable_text:
+                    include_match = True
+                    break
+        else:
+            include_match = True  # No include patterns means include all
+
+        # Check if block matches exclude patterns
+        exclude_match = False
+        for pattern in exclude_patterns:
+            if pattern in searchable_text:
+                exclude_match = True
+                break
+
+        # Include block if it matches include and doesn't match exclude
+        if include_match and not exclude_match:
+            filtered_blocks[block_id] = block_data
+
+    return {
+        "ok": True,
+        "blocks": filtered_blocks,
+        "view": view_name,
+        "total": len(all_blocks),
+        "filtered": len(filtered_blocks)
+    }
+
+
+@app.get("/cuez/views/config", response_class=JSONResponse)
+def cuez_views_config_get():
+    """Get current custom views configuration."""
+    return {"ok": True, "views": CONFIG.cuez_custom_views}
+
+
+@app.post("/cuez/views/config")
+def cuez_views_config_update(views: List[Dict[str, Any]]):
+    """Update custom views configuration."""
+    CONFIG.cuez_custom_views = views
+    save_config(CONFIG)
+    return {"ok": True, "views": CONFIG.cuez_custom_views}
+
+
 # ================== iNews CLEANER ENDPOINTS ==================
 
 @app.post("/config/module/inews")
@@ -2233,6 +2364,19 @@ def send_manual(payload: Dict[str, str]):
         return {"sent_to": "datastream", "payload": payload, **result}
     except Exception as e:
         raise HTTPException(500, f"Manual send failed: {e}")
+
+
+@app.get("/update_now")
+def update_now():
+    """Fetch live TfL data and send to datastream."""
+    try:
+        line_statuses = fetch_all_line_statuses()
+        result = send_to_datastream(line_statuses)
+        log_event("TfL Live Update", f"Fetched and sent live data for {len(line_statuses)} lines")
+        return {"ok": True, "line_statuses": line_statuses, **result}
+    except Exception as e:
+        logger.error(f"Live update failed: {e}")
+        return {"ok": False, "error": str(e)}
 
 
 # ================== 8. Control app endpoints ==================
@@ -3127,7 +3271,10 @@ def modules_page(request: Request):
     parts.append('</div>')
     parts.append('<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">')
     parts.append('<p style="color: #8b949e; margin: 0;">Connect to Cuez Automator for rundown navigation, button triggering, and macro execution.</p>')
+    parts.append('<div style="display: flex; gap: 8px;">')
+    parts.append('<a href="/cuez/views" target="_blank" style="display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; background: #3d3d3d; color: #fff; text-decoration: none; border-radius: 6px; font-size: 12px; font-weight: 500; transition: background 0.2s;">Custom Views <span style="font-size: 10px;">↗</span></a>')
     parts.append('<a href="/cuez/control" target="_blank" style="display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px; background: #3d3d3d; color: #fff; text-decoration: none; border-radius: 6px; font-size: 12px; font-weight: 500; transition: background 0.2s;">Open Standalone <span style="font-size: 10px;">↗</span></a>')
+    parts.append('</div>')
     parts.append('</div>')
 
     # Cuez content container
@@ -4183,8 +4330,8 @@ def tfl_manual_standalone(request: Request):
     parts.append("  .line-row { display: flex; align-items: stretch; margin-bottom: 6px; border-radius: 6px; overflow: hidden; background: #252525; }")
     parts.append("  .line-label { width: 140px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; padding: 12px 8px; }")
     parts.append("  .line-label span { font-size: 11px; font-weight: 600; text-align: center; line-height: 1.2; }")
-    parts.append("  .line-input { flex: 1; padding: 12px 14px; font-size: 12px; background: #0c6473; color: #fff; border: none; font-weight: 500; outline: none; font-family: inherit; }")
-    parts.append("  .line-input::placeholder { color: rgba(255,255,255,0.5); }")
+    parts.append("  input.line-input { flex: 1 !important; padding: 12px 14px !important; font-size: 12px !important; background: #0c6473; color: #fff !important; border: none !important; font-weight: 500 !important; outline: none !important; font-family: inherit !important; width: auto !important; margin: 0 !important; border-radius: 0 !important; }")
+    parts.append("  input.line-input::placeholder { color: rgba(255,255,255,0.5) !important; }")
     parts.append("  .actions { display: flex; justify-content: center; gap: 12px; padding-top: 20px; border-top: 1px solid #3d3d3d; }")
     parts.append("  button { padding: 14px 32px; font-size: 14px; font-weight: 600; border: none; border-radius: 8px; cursor: pointer; transition: all 0.2s; font-family: inherit; }")
     parts.append("  .btn-primary { background: #00bcd4; color: #fff; }")
@@ -4240,84 +4387,101 @@ def tfl_manual_standalone(request: Request):
     parts.append('<div class="status" id="status"></div>')
     parts.append("</div>")  # Close container
 
-    # JavaScript
-    tfl_lines_js = json.dumps(TFL_UNDERGROUND + TFL_OVERGROUND)
-    parts.append("<script>")
-    parts.append(f"const TFL_LINES = {tfl_lines_js};")
-    parts.append("function updateColour(input) {")
-    parts.append("  const val = input.value.trim().toLowerCase();")
-    parts.append("  input.style.background = (val === '' || val === 'good service') ? '#0c6473' : '#db422d';")
-    parts.append("}")
-    parts.append("function getPayload() {")
-    parts.append("  const payload = {};")
-    parts.append("  TFL_LINES.forEach(line => {")
-    parts.append("    const safeId = line.replace(/ /g, '-').replace(/&/g, 'and');")
-    parts.append("    const input = document.getElementById('manual-' + safeId);")
-    parts.append("    if (input) payload[line] = input.value.trim() || 'Good Service';")
-    parts.append("  });")
-    parts.append("  return payload;")
-    parts.append("}")
-    parts.append("async function sendUpdate() {")
-    parts.append("  const status = document.getElementById('status');")
-    parts.append("  status.textContent = 'Sending...';")
-    parts.append("  status.className = 'status';")
-    parts.append("  try {")
-    parts.append("    const res = await fetch('/manual', {")
-    parts.append("      method: 'POST',")
-    parts.append("      headers: { 'Content-Type': 'application/json' },")
-    parts.append("      body: JSON.stringify(getPayload())")
-    parts.append("    });")
-    parts.append("    if (res.ok) {")
-    parts.append("      status.textContent = 'Update sent successfully';")
-    parts.append("      status.className = 'status success';")
-    parts.append("    } else {")
-    parts.append("      status.textContent = 'Failed to send update';")
-    parts.append("      status.className = 'status error';")
-    parts.append("    }")
-    parts.append("  } catch (e) {")
-    parts.append("    status.textContent = 'Error: ' + e.message;")
-    parts.append("    status.className = 'status error';")
-    parts.append("  }")
-    parts.append("}")
-    parts.append("async function sendLiveUpdate() {")
-    parts.append("  const status = document.getElementById('status');")
-    parts.append("  status.textContent = 'Fetching live TfL data...';")
-    parts.append("  status.className = 'status';")
-    parts.append("  try {")
-    parts.append("    const res = await fetch('/update_now');")
-    parts.append("    const data = await res.json();")
-    parts.append("    if (data.ok) {")
-    parts.append("      status.textContent = 'Live update sent successfully';")
-    parts.append("      status.className = 'status success';")
-    parts.append("      // Update input fields with live data")
-    parts.append("      if (data.line_statuses) {")
-    parts.append("        Object.entries(data.line_statuses).forEach(([line, statusText]) => {")
-    parts.append("          const safeId = line.replace(/ /g, '-').replace(/&/g, 'and');")
-    parts.append("          const input = document.getElementById('manual-' + safeId);")
-    parts.append("          if (input) {")
-    parts.append("            input.value = statusText;")
-    parts.append("            input.style.background = (statusText === 'Good Service') ? '#0c6473' : '#db422d';")
-    parts.append("          }")
-    parts.append("        });")
-    parts.append("      }")
-    parts.append("    } else {")
-    parts.append("      status.textContent = 'Failed to fetch live update: ' + (data.error || 'Unknown error');")
-    parts.append("      status.className = 'status error';")
-    parts.append("    }")
-    parts.append("  } catch (e) {")
-    parts.append("    status.textContent = 'Error: ' + e.message;")
-    parts.append("    status.className = 'status error';")
-    parts.append("  }")
-    parts.append("}")
-    parts.append("function resetAll() {")
-    parts.append("  TFL_LINES.forEach(line => {")
-    parts.append("    const safeId = line.replace(/ /g, '-').replace(/&/g, 'and');")
-    parts.append("    const input = document.getElementById('manual-' + safeId);")
-    parts.append("    if (input) { input.value = ''; input.style.background = '#0c6473'; }")
-    parts.append("  });")
-    parts.append("  document.getElementById('status').textContent = '';")
-    parts.append("}")
-    parts.append("</script>")
+    # JavaScript - use list and join like the working modules page
+    js_lines = [
+        "<script>",
+        "const TFL_LINES = " + json.dumps(TFL_UNDERGROUND + TFL_OVERGROUND) + ";",
+        "",
+        "function updateColour(input) {",
+        "  var value = input.value.trim().toLowerCase();",
+        '  if (value === "" || value === "good service") {',
+        '    input.style.background = "#0c6473";',
+        "  } else {",
+        '    input.style.background = "#db422d";',
+        "  }",
+        "}",
+        "",
+        "function getPayload() {",
+        "  const payload = {};",
+        "  TFL_LINES.forEach(line => {",
+        '    const safeId = line.replace(/ /g, "-").replace(/&/g, "and");',
+        '    const input = document.getElementById("manual-" + safeId);',
+        '    if (input) payload[line] = input.value.trim() || "Good Service";',
+        "  });",
+        "  return payload;",
+        "}",
+        "",
+        "async function sendUpdate() {",
+        '  const status = document.getElementById("status");',
+        '  status.textContent = "Sending...";',
+        '  status.className = "status";',
+        "  try {",
+        '    const res = await fetch("/manual", {',
+        '      method: "POST",',
+        '      headers: { "Content-Type": "application/json" },',
+        "      body: JSON.stringify(getPayload())",
+        "    });",
+        "    if (res.ok) {",
+        '      status.textContent = "Update sent successfully";',
+        '      status.className = "status success";',
+        "    } else {",
+        '      status.textContent = "Failed to send update";',
+        '      status.className = "status error";',
+        "    }",
+        "  } catch (e) {",
+        '    status.textContent = "Error: " + e.message;',
+        '    status.className = "status error";',
+        "  }",
+        "}",
+        "",
+        "async function sendLiveUpdate() {",
+        '  const status = document.getElementById("status");',
+        '  status.textContent = "Fetching live TfL data...";',
+        '  status.className = "status";',
+        "  try {",
+        '    const res = await fetch("/update_now");',
+        "    const data = await res.json();",
+        "    if (data.ok) {",
+        '      status.textContent = "Live update sent successfully";',
+        '      status.className = "status success";',
+        "      if (data.line_statuses) {",
+        "        Object.entries(data.line_statuses).forEach(([line, statusText]) => {",
+        '          const safeId = line.replace(/ /g, "-").replace(/&/g, "and");',
+        '          const input = document.getElementById("manual-" + safeId);',
+        "          if (input) {",
+        "            input.value = statusText;",
+        '            if (statusText === "Good Service") {',
+        '              input.style.background = "#0c6473";',
+        "            } else {",
+        '              input.style.background = "#db422d";',
+        "            }",
+        "          }",
+        "        });",
+        "      }",
+        "    } else {",
+        '      status.textContent = "Failed to fetch live update: " + (data.error || "Unknown error");',
+        '      status.className = "status error";',
+        "    }",
+        "  } catch (e) {",
+        '    status.textContent = "Error: " + e.message;',
+        '    status.className = "status error";',
+        "  }",
+        "}",
+        "",
+        "function resetAll() {",
+        "  TFL_LINES.forEach(line => {",
+        '    const safeId = line.replace(/ /g, "-").replace(/&/g, "and");',
+        '    const input = document.getElementById("manual-" + safeId);',
+        "    if (input) {",
+        '      input.value = "";',
+        '      input.style.background = "#0c6473";',
+        "    }",
+        "  });",
+        '  document.getElementById("status").textContent = "";',
+        "}",
+        "</script>",
+    ]
+    parts.append("\n".join(js_lines))
     parts.append("</body></html>")
     return HTMLResponse("".join(parts))
 
@@ -4361,6 +4525,382 @@ def cuez_control_standalone(request: Request):
     parts.append("document.getElementById('macros').innerHTML=macs.map(m=>`<div class='item'><div><div>${m.title||m.id}</div><div class='id' onclick='copy(\"${m.id}\")'>${m.id}</div></div><button onclick='fetch(\"/cuez/macros/${m.id}/run\",{method:\"POST\"})'>Run</button></div>`).join('');")
     parts.append("async function loadItems(){const r=await fetch('/cuez/items');const d=await r.json();if(d.ok&&d.items)document.getElementById('items').innerHTML=d.items.map(i=>{const id=i.id||i.Id||i._id||'';const name=i.name||i.title||i.Name||id;return`<div class='item'><div><div>${name}</div><div class='id' onclick='copy(\"${id}\")'>${id}</div></div></div>`;}).join('');}")
     parts.append("async function loadBlocks(){const r=await fetch('/cuez/blocks');const d=await r.json();if(d.ok&&d.blocks){const blocksArray=Object.values(d.blocks);document.getElementById('blocks').innerHTML=blocksArray.map(b=>{const id=b.id||b.Id||b._id||'';const name=(b.title&&b.title.title)||b.name||b.Name||id;return`<div class='item'><div><div>${name}</div><div class='id' onclick='copy(\"${id}\")'>${id}</div></div><button onclick='fetch(\"/cuez/trigger/${id}\")'>Trigger</button></div>`;}).join('');}}")
+    parts.append("</script></body></html>")
+    return HTMLResponse("".join(parts))
+
+
+@app.get("/cuez/views", response_class=HTMLResponse)
+def cuez_views_page(request: Request):
+    """Multi-view Cuez Automator page with custom filtered views."""
+    import json
+    views = CONFIG.cuez_custom_views
+    views_json = json.dumps(views)
+
+    html = """<!DOCTYPE html>
+<html>
+<head>
+    <title>Cuez Views</title>
+    <link rel="icon" href="/static/favicon.ico">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, sans-serif; background: #1a1a1a; color: #fff; padding: 20px; }
+        .container { max-width: 1400px; margin: 0 auto; }
+        h1 { text-align: center; margin-bottom: 20px; }
+        .tabs { display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; }
+        .tab { padding: 12px 20px; background: #252525; color: #aaa; border: none; border-radius: 6px; cursor: pointer; }
+        .tab:hover { background: #2d2d2d; }
+        .tab.active { background: #00bcd4; color: #fff; }
+        .blocks { display: flex; flex-direction: column; gap: 16px; padding: 20px; max-width: 800px; }
+        .block { background: #f5f5f5; border-left: 4px solid #00bcd4; display: flex; overflow: hidden; }
+        .block-item-header { background: #00bcd4; color: #fff; padding: 8px 16px; font-weight: 600; display: flex; justify-content: space-between; align-items: center; }
+        .block-item-number { font-size: 13px; }
+        .block-item-title { font-size: 13px; }
+        .block-content-wrapper { display: flex; flex: 1; }
+        .block-left { flex: 1; padding: 16px; background: #fff; }
+        .block-right { width: 200px; height: 150px; background: #000; position: relative; display: flex; align-items: center; justify-content: center; flex-shrink: 0; overflow: hidden; }
+        .block-badges { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+        .block-type { display: inline-block; padding: 4px 10px; border-radius: 3px; font-size: 11px; font-weight: 600; color: #fff; }
+        .block-badge { display: inline-block; padding: 4px 10px; border-radius: 3px; font-size: 11px; font-weight: 600; color: #000; }
+        .type-video { background: #4caf50; }
+        .type-bugs { background: #9c27b0; }
+        .type-script { background: #ff9800; }
+        .type-default { background: #607d8b; }
+        .badge-c { background: #ff9800; }
+        .badge-a { background: #f44336; }
+        .badge-b { background: #ff9800; }
+        .block-field { font-size: 12px; margin: 8px 0; color: #666; }
+        .block-field-label { font-weight: 600; display: inline-block; min-width: 70px; }
+        .block-field-value { background: #37474f; color: #fff; padding: 3px 8px; border-radius: 3px; font-family: monospace; font-size: 11px; }
+        .block-thumbnail-wrapper { position: relative; width: 100%; height: 100%; max-height: 150px; }
+        .block-thumbnail-wrapper img { width: 100%; height: auto; max-height: 150px; object-fit: contain; display: block; }
+        .play-overlay { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 50px; height: 50px; background: #00bcd4; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 20px; }
+        .duration-badge { position: absolute; bottom: 8px; right: 8px; background: rgba(0,0,0,0.8); color: #fff; padding: 4px 8px; border-radius: 3px; font-size: 11px; font-family: monospace; }
+        .trigger-btn { padding: 10px 20px; background: #00bcd4; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-weight: 600; margin-top: 12px; width: 100%; }
+        .trigger-btn:hover { background: #0097a7; }
+        .loading { text-align: center; padding: 40px; color: #888; }
+        .pulse {
+            display: inline-block;
+            width: 60px;
+            height: 60px;
+            border-radius: 50%;
+            background: #00bcd4;
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.1); opacity: 0.7; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Cuez Automator Views</h1>
+        <div class="tabs" id="tabs-container">
+            <button class="tab active" data-view="all">📋 All Blocks</button>
+        </div>
+        <div id="blocks-container" class="blocks">
+            <div class="loading"><div class="pulse"></div><p style="margin-top: 16px; color: #00bcd4; font-weight: 600;">Loading blocks...</p></div>
+        </div>
+    </div>
+
+    <script>
+        const VIEWS = """ + views_json + """;
+        let currentView = 'all';
+
+        async function loadView(viewName, evt) {
+            console.log('loadView called with:', viewName);
+            currentView = viewName;
+
+            // Update active tab
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            if (evt && evt.target) {
+                evt.target.classList.add('active');
+            } else {
+                // If no event (page load), activate the first tab
+                const firstTab = document.querySelector('.tab');
+                if (firstTab) firstTab.classList.add('active');
+            }
+
+            const container = document.getElementById('blocks-container');
+            container.innerHTML = '<div class="loading"><div class="pulse"></div><p style="margin-top: 16px; color: #00bcd4; font-weight: 600;">Loading blocks...</p></div>';
+
+            try {
+                const url = viewName === 'all' ? '/cuez/blocks' : `/cuez/blocks/filtered?view_name=${encodeURIComponent(viewName)}`;
+                console.log('Fetching from:', url);
+                const response = await fetch(url);
+                const data = await response.json();
+
+                console.log('Loaded', Object.keys(data.blocks || {}).length, 'blocks');
+                console.log('Response data:', data);
+
+                if (!data.ok || !data.blocks) {
+                    container.innerHTML = '<div class="loading">Error loading blocks</div>';
+                    return;
+                }
+
+                const blocks = Object.entries(data.blocks);
+
+                if (blocks.length === 0) {
+                    container.innerHTML = '<div class="loading">No blocks found</div>';
+                    return;
+                }
+
+                console.log('About to render', blocks.length, 'blocks');
+                console.log('First block sample:', blocks[0]);
+
+                // Render blocks
+                container.innerHTML = blocks.map(([id, block], index) => {
+                    const type = block.typeTitle || 'Unknown';
+                    const title = block.title?.title || id;
+
+                    // Extract TYPE field (ULAY, etc)
+                    const typeField = block.fields?.find(f => f.label === 'TYPE');
+                    const typeValue = typeField?.value ? (Array.isArray(typeField.value) ? typeField.value[0] : typeField.value) : '';
+
+                    // Extract CHANNEL field
+                    const channelField = block.fields?.find(f => f.label === 'CHANNEL');
+                    const channelValue = channelField?.value ? (Array.isArray(channelField.value) ? channelField.value.join(', ') : channelField.value) : '';
+
+                    // Extract DETAILS field
+                    const detailsField = block.fields?.find(f => f.label === 'DETAILS');
+                    let detailsValue = '';
+                    if (detailsField?.value) {
+                        if (typeof detailsField.value === 'object' && detailsField.value.html) {
+                            detailsValue = detailsField.value.html.replace(/<br[^>]*>/gi, ' ').replace(/<[^>]*>/g, '').trim();
+                        } else if (typeof detailsField.value === 'string') {
+                            detailsValue = detailsField.value;
+                        }
+                    }
+
+                    // Extract duration
+                    const durationSec = block.posterframes?.default_clip_media?.duration || 0;
+                    let duration = '';
+                    if (durationSec) {
+                        const mins = Math.floor(durationSec / 60);
+                        const secs = Math.floor(durationSec % 60);
+                        duration = String(mins).padStart(2, '0') + ':' + String(secs).padStart(2, '0');
+                    }
+
+                    // Extract thumbnail - use posterframes.default_clip_media only
+                    const thumbnail = block.posterframes?.default_clip_media?.thumbnail || '';
+
+                    // Determine color class
+                    let typeClass = 'type-default';
+                    if (type.includes('VIDEO')) typeClass = 'type-video';
+                    else if (type.includes('BUG') || type.includes('STRAP')) typeClass = 'type-bugs';
+                    else if (type.includes('SCRIPT')) typeClass = 'type-script';
+
+                    // Determine badge class for TYPE value
+                    let badgeClass = 'badge-c';
+                    if (typeValue === 'A') badgeClass = 'badge-a';
+                    else if (typeValue === 'B') badgeClass = 'badge-b';
+
+                    // Build Automator-style layout
+                    let html = '<div style="margin-bottom: 16px;">';
+
+                    // Header with item number and title
+                    html += '<div class="block-item-header">';
+                    html += `<span class="block-item-number">ITEM ${index + 1}</span>`;
+                    html += `<span class="block-item-title">${title.split('_').slice(1, -2).join(' ')}</span>`;
+                    html += '</div>';
+
+                    html += '<div class="block">';
+                    html += '<div class="block-content-wrapper">';
+
+                    // Left side
+                    html += '<div class="block-left">';
+                    html += '<div class="block-badges">';
+                    html += `<span class="block-type ${typeClass}">${type}</span>`;
+                    if (typeValue) html += `<span class="block-badge ${badgeClass}">${typeValue}</span>`;
+                    html += '</div>';
+
+                    html += `<div class="block-field"><span class="block-field-label">Title</span> <span class="block-field-value">${title}</span></div>`;
+
+                    if (channelValue) {
+                        html += `<div class="block-field"><span class="block-field-label">CHANNEL</span> <span class="block-field-value">${channelValue}</span></div>`;
+                    }
+
+                    if (detailsValue) {
+                        html += `<div class="block-field"><span class="block-field-label">DETAILS</span> <span class="block-field-value">${detailsValue}</span></div>`;
+                    }
+
+                    html += `<button class="trigger-btn" data-block-id="${id}">▶ Trigger</button>`;
+                    html += '</div>';
+
+                    // Right side - Thumbnail (no play button, just duration badge)
+                    if (thumbnail) {
+                        html += '<div class="block-right">';
+                        html += `<img src="${thumbnail}" alt="Thumbnail" style="max-width: 100%; max-height: 100%; object-fit: contain;" />`;
+                        if (duration) html += `<div class="duration-badge">${duration}</div>`;
+                        html += '</div>';
+                    }
+
+                    html += '</div>';
+                    html += '</div>';
+                    html += '</div>';
+                    return html;
+                }).join('');
+
+            } catch (error) {
+                console.error('Error:', error);
+                container.innerHTML = '<div class="loading">Error: ' + error.message + '</div>';
+            }
+        }
+
+        async function trigger(id) {
+            try {
+                await fetch(`/cuez/trigger/${id}`);
+                console.log('Triggered', id);
+            } catch (error) {
+                console.error('Trigger failed:', error);
+            }
+        }
+
+        // Build tabs from VIEWS data
+        function buildTabs() {
+            const tabsContainer = document.getElementById('tabs-container');
+            VIEWS.forEach(view => {
+                const btn = document.createElement('button');
+                btn.className = 'tab';
+                btn.dataset.view = view.name;
+                btn.textContent = `${view.icon || '📁'} ${view.name}`;
+                tabsContainer.appendChild(btn);
+            });
+        }
+
+        // Event delegation for tabs
+        document.getElementById('tabs-container').addEventListener('click', (e) => {
+            if (e.target.classList.contains('tab')) {
+                const viewName = e.target.dataset.view;
+                loadView(viewName, e);
+            }
+        });
+
+        // Event delegation for trigger buttons
+        document.addEventListener('click', (e) => {
+            if (e.target.classList.contains('trigger-btn')) {
+                const blockId = e.target.dataset.blockId;
+                if (blockId) trigger(blockId);
+            }
+        });
+
+        // Initialize
+        buildTabs();
+        setTimeout(() => loadView('all'), 100);
+    </script>
+</body>
+</html>
+"""
+
+    return HTMLResponse(html)
+
+
+@app.get("/cuez/views/manage", response_class=HTMLResponse)
+def cuez_views_manage_page(request: Request):
+    """Configuration page for managing custom views."""
+    parts = ["<!DOCTYPE html><html><head><title>Manage Cuez Views</title>"]
+    parts.append('<link rel="icon" href="/static/favicon.ico">')
+    parts.append("<style>")
+    parts.append("@font-face { font-family: 'ITVReem'; src: url('/static/ITV Reem-Regular.ttf') format('truetype'); font-weight: 400; }")
+    parts.append("@font-face { font-family: 'ITVReem'; src: url('/static/ITV Reem-Medium.ttf') format('truetype'); font-weight: 500; }")
+    parts.append("@font-face { font-family: 'ITVReem'; src: url('/static/ITV Reem-Bold.ttf') format('truetype'); font-weight: 700; }")
+    parts.append("* { box-sizing: border-box; margin: 0; padding: 0; }")
+    parts.append("body { font-family: 'ITVReem', -apple-system, sans-serif; background: #1a1a1a; color: #fff; padding: 20px; }")
+    parts.append(".container { max-width: 900px; margin: 0 auto; }")
+    parts.append("h1 { text-align: center; margin-bottom: 10px; }")
+    parts.append("p { text-align: center; color: #888; margin-bottom: 30px; }")
+    parts.append(".view-card { background: #252525; padding: 20px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid; }")
+    parts.append(".view-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }")
+    parts.append(".view-title { font-size: 18px; font-weight: 600; display: flex; align-items: center; gap: 8px; }")
+    parts.append(".view-icon { font-size: 24px; }")
+    parts.append("input, textarea { width: 100%; padding: 10px; background: #1e1e1e; border: 1px solid #3d3d3d; border-radius: 6px; color: #fff; font-family: inherit; font-size: 14px; margin-top: 5px; }")
+    parts.append("input:focus, textarea:focus { outline: none; border-color: #00bcd4; }")
+    parts.append("label { display: block; margin-bottom: 10px; color: #aaa; font-size: 13px; font-weight: 500; }")
+    parts.append("textarea { resize: vertical; min-height: 80px; font-family: monospace; }")
+    parts.append(".patterns-help { font-size: 11px; color: #666; margin-top: 4px; }")
+    parts.append("button { padding: 10px 20px; background: #00bcd4; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 14px; }")
+    parts.append("button:hover { background: #0097a7; }")
+    parts.append("button.delete { background: #d32f2f; }")
+    parts.append("button.delete:hover { background: #b71c1c; }")
+    parts.append("button.secondary { background: #3d3d3d; }")
+    parts.append("button.secondary:hover { background: #4d4d4d; }")
+    parts.append(".actions { display: flex; gap: 10px; justify-content: center; margin-top: 30px; }")
+    parts.append(".status { text-align: center; padding: 12px; border-radius: 6px; margin-top: 20px; display: none; }")
+    parts.append(".status.success { background: #1b5e20; color: #4caf50; display: block; }")
+    parts.append(".status.error { background: #b71c1c; color: #ef5350; display: block; }")
+    parts.append("</style></head><body><div class='container'>")
+    parts.append("<h1>Manage Custom Views</h1>")
+    parts.append("<p>Configure filtered views for Cuez Automator blocks. Use patterns to match block names (case-insensitive).</p>")
+    parts.append("<div id='views-container'></div>")
+    parts.append("<div class='actions'>")
+    parts.append("<button onclick='addView()'>➕ Add New View</button>")
+    parts.append("<button onclick='saveViews()'>💾 Save Configuration</button>")
+    parts.append("<button class='secondary' onclick='window.close()'>✕ Close</button>")
+    parts.append("</div>")
+    parts.append("<div id='status' class='status'></div>")
+    parts.append("</div>")
+    parts.append("<script>")
+    parts.append("let views = [];")
+    parts.append("async function loadViews() {")
+    parts.append("  const res = await fetch('/cuez/views/config');")
+    parts.append("  const data = await res.json();")
+    parts.append("  if (data.ok) { views = data.views; renderViews(); }")
+    parts.append("}")
+    parts.append("function renderViews() {")
+    parts.append("  const container = document.getElementById('views-container');")
+    parts.append("  container.innerHTML = views.map((v, i) => {")
+    parts.append("    const color = v.color || '#00bcd4';")
+    parts.append("    return `<div class='view-card' style='border-left-color: ${color};'>")
+    parts.append("      <div class='view-header'>")
+    parts.append("        <div class='view-title'><span class='view-icon'>${v.icon || '📁'}</span> ${v.name || 'Unnamed'}</div>")
+    parts.append("        <button class='delete' onclick='deleteView(${i})'>🗑 Delete</button>")
+    parts.append("      </div>")
+    parts.append("      <label>Name <input type='text' value='${v.name || ''}' oninput='updateView(${i}, \"name\", this.value)' /></label>")
+    parts.append("      <label>Icon <input type='text' value='${v.icon || '📁'}' oninput='updateView(${i}, \"icon\", this.value)' placeholder='Emoji icon' /></label>")
+    parts.append("      <label>Color <input type='text' value='${v.color || '#00bcd4'}' oninput='updateView(${i}, \"color\", this.value)' placeholder='#00bcd4' /></label>")
+    parts.append("      <label style='display: flex; align-items: center; gap: 10px;'><input type='checkbox' ${v.filters?.exclude_scripts ? 'checked' : ''} onchange='updateCheckbox(${i}, \"exclude_scripts\", this.checked)' style='width: auto;' /> Exclude Scripts</label>")
+    parts.append("      <label>Include Patterns (one per line)<textarea oninput='updatePatterns(${i}, \"include_patterns\", this.value)'>${(v.filters?.include_patterns || []).join('\\n')}</textarea><div class='patterns-help'>Block names/types containing these words will be included</div></label>")
+    parts.append("      <label>Exclude Patterns (one per line, optional)<textarea oninput='updatePatterns(${i}, \"exclude_patterns\", this.value)'>${(v.filters?.exclude_patterns || []).join('\\n')}</textarea><div class='patterns-help'>Block names/types containing these words will be excluded</div></label>")
+    parts.append("    </div>`;")
+    parts.append("  }).join('');")
+    parts.append("}")
+    parts.append("function updateView(index, field, value) {")
+    parts.append("  views[index][field] = value;")
+    parts.append("}")
+    parts.append("function updatePatterns(index, field, value) {")
+    parts.append("  if (!views[index].filters) views[index].filters = {};")
+    parts.append("  views[index].filters[field] = value.split('\\n').map(p => p.trim()).filter(p => p);")
+    parts.append("}")
+    parts.append("function updateCheckbox(index, field, value) {")
+    parts.append("  if (!views[index].filters) views[index].filters = {};")
+    parts.append("  views[index].filters[field] = value;")
+    parts.append("}")
+    parts.append("function addView() {")
+    parts.append("  views.push({ name: 'New View', icon: '📁', color: '#00bcd4', filters: { include_patterns: [], exclude_patterns: [] } });")
+    parts.append("  renderViews();")
+    parts.append("}")
+    parts.append("function deleteView(index) {")
+    parts.append("  if (confirm('Delete this view?')) { views.splice(index, 1); renderViews(); }")
+    parts.append("}")
+    parts.append("async function saveViews() {")
+    parts.append("  const status = document.getElementById('status');")
+    parts.append("  try {")
+    parts.append("    const res = await fetch('/cuez/views/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(views) });")
+    parts.append("    const data = await res.json();")
+    parts.append("    if (data.ok) {")
+    parts.append("      status.textContent = '✓ Configuration saved successfully!';")
+    parts.append("      status.className = 'status success';")
+    parts.append("      setTimeout(() => status.className = 'status', 3000);")
+    parts.append("    } else {")
+    parts.append("      status.textContent = 'Error: ' + (data.error || 'Unknown');")
+    parts.append("      status.className = 'status error';")
+    parts.append("    }")
+    parts.append("  } catch (e) {")
+    parts.append("    status.textContent = 'Error: ' + e.message;")
+    parts.append("    status.className = 'status error';")
+    parts.append("  }")
+    parts.append("}")
+    parts.append("loadViews();")
     parts.append("</script></body></html>")
     return HTMLResponse("".join(parts))
 

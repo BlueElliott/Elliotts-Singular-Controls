@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Cuez Keyboard Shortcuts",
+  "version": "1.0.0",
+  "description": "Add custom keyboard shortcuts to Cuez.live for cueing and timing control",
+  "permissions": [
+    "activeTab"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://app.cuez.live/*"],
+      "js": ["content.js"],
+      "run_at": "document_end"
+    }
+  ],
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}
