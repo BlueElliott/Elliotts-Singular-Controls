@@ -214,6 +214,11 @@ class AppConfig(BaseModel):
     cuez_custom_views: List[Dict[str, Any]] = []  # Custom filtered views configuration
     # iNews Cleaner module settings
     enable_inews: bool = False
+    # CasparCG module settings
+    enable_casparcg: bool = False
+    casparcg_host: str = "172.26.4.100"
+    casparcg_port: int = 5250
+    casparcg_cached_media: List[Dict[str, Any]] = []  # Cached media list
     theme: str = "dark"
     port: Optional[int] = None
 
@@ -265,6 +270,11 @@ def load_config() -> AppConfig:
                 }
             }
         ],
+        # CasparCG defaults
+        "enable_casparcg": False,
+        "casparcg_host": os.getenv("CASPARCG_HOST", "172.26.4.100"),
+        "casparcg_port": int(os.getenv("CASPARCG_PORT", "5250")),
+        "casparcg_cached_media": [],
         "theme": "dark",
         "port": int(os.getenv("SINGULAR_TWEAKS_PORT")) if os.getenv("SINGULAR_TWEAKS_PORT") else None,
     }
@@ -972,6 +982,177 @@ def cuez_trigger_block(block_id: str) -> Dict[str, Any]:
         return {"ok": False, "error": e.detail}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+# ================== CASPARCG AMCP CLIENT ==================
+
+def casparcg_send_command(command: str, timeout: int = 10) -> Dict[str, Any]:
+    """Send an AMCP command to CasparCG server and return the response."""
+    import socket
+
+    if not CONFIG.enable_casparcg:
+        raise HTTPException(400, "CasparCG module is disabled")
+
+    if not CONFIG.casparcg_host or not CONFIG.casparcg_port:
+        raise HTTPException(400, "CasparCG host/port not configured")
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((CONFIG.casparcg_host, CONFIG.casparcg_port))
+
+        # Send command with CRLF terminator immediately after connection
+        sock.sendall((command + "\r\n").encode('utf-8'))
+
+        # Read response - for CLS this can be large with many media files
+        response = b''
+        sock.settimeout(2)  # Shorter timeout for reading chunks
+
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+
+                # AMCP multi-line responses end with a blank line (\r\n\r\n)
+                # Single line responses end with \r\n
+                decoded = response.decode('utf-8', errors='ignore')
+                if '\r\n\r\n' in decoded or (decoded.count('\r\n') == 1 and len(response) < 200):
+                    break
+
+                # Safety check - don't read more than 1MB
+                if len(response) > 1024 * 1024:
+                    break
+        except socket.timeout:
+            # Timeout is OK if we already got some data
+            if len(response) == 0:
+                raise
+
+        sock.close()
+
+        response_text = response.decode('utf-8', errors='ignore')
+
+        # Log response for debugging
+        logger.info(f"CasparCG command '{command}' response: {len(response_text)} chars")
+
+        return {
+            "ok": True,
+            "command": command,
+            "response": response_text.strip()
+        }
+    except socket.timeout:
+        return {"ok": False, "error": "Connection timed out - CasparCG may not be responding"}
+    except ConnectionRefusedError:
+        return {"ok": False, "error": "Connection refused - CasparCG may not be running"}
+    except Exception as e:
+        logger.error(f"CasparCG command error: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+def casparcg_test_connection() -> Dict[str, Any]:
+    """Test connection to CasparCG server."""
+    if not CONFIG.casparcg_host:
+        return {"ok": False, "error": "No CasparCG host configured"}
+
+    # Try to get server version
+    result = casparcg_send_command("VERSION")
+    if result["ok"]:
+        return {
+            "ok": True,
+            "host": CONFIG.casparcg_host,
+            "port": CONFIG.casparcg_port,
+            "version": result.get("response", "")
+        }
+    return result
+
+
+def casparcg_get_media() -> Dict[str, Any]:
+    """Get list of all media files from CasparCG server."""
+    result = casparcg_send_command("CLS")
+    if not result["ok"]:
+        return result
+
+    response_text = result["response"]
+    logger.info(f"CasparCG CLS raw response:\n{response_text[:500]}")
+
+    # Parse CLS response
+    # Format: 200 CLS OK
+    # "FILENAME" TYPE SIZE UPDATED FRAMES
+    # or: 201 CLS OK (followed by media list)
+    media_list = []
+    response_lines = response_text.split('\n')
+
+    logger.info(f"CasparCG CLS response has {len(response_lines)} lines")
+
+    for idx, line in enumerate(response_lines):
+        line = line.strip()
+
+        # Skip empty lines, status lines, and the final blank line
+        if not line or line.startswith("200") or line.startswith("201"):
+            logger.info(f"Line {idx}: Skipping status/empty: '{line[:50]}'")
+            continue
+
+        # Parse quoted filename and metadata
+        if line.startswith('"'):
+            try:
+                # Extract filename from quotes
+                end_quote = line.index('"', 1)
+                filename = line[1:end_quote]
+                # Get remaining metadata
+                metadata = line[end_quote+1:].strip().split()
+
+                media_type = metadata[0] if len(metadata) > 0 else "UNKNOWN"
+                size = metadata[1] if len(metadata) > 1 else "0"
+
+                logger.info(f"Line {idx}: Found media: {filename} ({media_type})")
+
+                media_list.append({
+                    "filename": filename,
+                    "type": media_type,
+                    "size": size,
+                    "path": filename
+                })
+            except (ValueError, IndexError) as e:
+                logger.warning(f"Line {idx}: Failed to parse: '{line[:50]}' - {e}")
+                continue
+        else:
+            logger.info(f"Line {idx}: Doesn't start with quote: '{line[:50]}'")
+
+    # Cache the media list
+    CONFIG.casparcg_cached_media = media_list
+    save_config(CONFIG)
+
+    return {
+        "ok": True,
+        "media": media_list,
+        "count": len(media_list)
+    }
+
+
+def casparcg_play(channel: int, layer: int, clip: str, loop: bool = False) -> Dict[str, Any]:
+    """Play a clip on specified channel and layer."""
+    loop_param = " LOOP" if loop else ""
+    command = f"PLAY {channel}-{layer} {clip}{loop_param}"
+    return casparcg_send_command(command)
+
+
+def casparcg_load(channel: int, layer: int, clip: str) -> Dict[str, Any]:
+    """Load a clip (paused) on specified channel and layer."""
+    command = f"LOAD {channel}-{layer} {clip}"
+    return casparcg_send_command(command)
+
+
+def casparcg_stop(channel: int, layer: int) -> Dict[str, Any]:
+    """Stop playback on specified channel and layer."""
+    command = f"STOP {channel}-{layer}"
+    return casparcg_send_command(command)
+
+
+def casparcg_clear(channel: int, layer: int) -> Dict[str, Any]:
+    """Clear specified channel and layer."""
+    command = f"CLEAR {channel}-{layer}"
+    return casparcg_send_command(command)
 
 
 # ================== iNews CLEANER HELPER ==================
@@ -2126,6 +2307,87 @@ def cuez_views_config_update(views: List[Dict[str, Any]]):
     CONFIG.cuez_custom_views = views
     save_config(CONFIG)
     return {"ok": True, "views": CONFIG.cuez_custom_views}
+
+
+# ================== CASPARCG ENDPOINTS ==================
+
+class CasparCGConfigData(BaseModel):
+    host: str
+    port: int
+
+
+@app.post("/config/module/casparcg")
+def toggle_casparcg_module(enabled: Dict[str, bool]):
+    """Enable/disable CasparCG module."""
+    CONFIG.enable_casparcg = enabled.get("enabled", False)
+    save_config(CONFIG)
+    return {"ok": True, "enabled": CONFIG.enable_casparcg}
+
+
+@app.post("/config/casparcg")
+def save_casparcg_config(config: CasparCGConfigData):
+    """Save CasparCG connection settings."""
+    CONFIG.casparcg_host = config.host
+    CONFIG.casparcg_port = config.port
+    save_config(CONFIG)
+    return {"ok": True, "host": CONFIG.casparcg_host, "port": CONFIG.casparcg_port}
+
+
+@app.get("/casparcg/test")
+def test_casparcg():
+    """Test connection to CasparCG server."""
+    return casparcg_test_connection()
+
+
+@app.get("/casparcg/media")
+def get_casparcg_media():
+    """Get list of all media files from CasparCG server."""
+    return casparcg_get_media()
+
+
+@app.get("/casparcg/media/cached")
+def get_casparcg_media_cached():
+    """Get cached list of media files."""
+    return {"ok": True, "media": CONFIG.casparcg_cached_media, "count": len(CONFIG.casparcg_cached_media)}
+
+
+@app.post("/casparcg/play")
+def casparcg_play_endpoint(
+    channel: int = Query(..., description="Channel number (1-10)"),
+    layer: int = Query(..., description="Layer number (0-999)"),
+    clip: str = Query(..., description="Clip filename"),
+    loop: bool = Query(False, description="Loop playback")
+):
+    """Play a clip on specified channel and layer."""
+    return casparcg_play(channel, layer, clip, loop)
+
+
+@app.post("/casparcg/load")
+def casparcg_load_endpoint(
+    channel: int = Query(..., description="Channel number (1-10)"),
+    layer: int = Query(..., description="Layer number (0-999)"),
+    clip: str = Query(..., description="Clip filename")
+):
+    """Load a clip (paused) on specified channel and layer."""
+    return casparcg_load(channel, layer, clip)
+
+
+@app.post("/casparcg/stop")
+def casparcg_stop_endpoint(
+    channel: int = Query(..., description="Channel number (1-10)"),
+    layer: int = Query(..., description="Layer number (0-999)")
+):
+    """Stop playback on specified channel and layer."""
+    return casparcg_stop(channel, layer)
+
+
+@app.post("/casparcg/clear")
+def casparcg_clear_endpoint(
+    channel: int = Query(..., description="Channel number (1-10)"),
+    layer: int = Query(..., description="Layer number (0-999)")
+):
+    """Clear specified channel and layer."""
+    return casparcg_clear(channel, layer)
 
 
 # ================== iNews CLEANER ENDPOINTS ==================
@@ -3409,6 +3671,59 @@ def modules_page(request: Request):
     parts.append('</div>')  # Close inews-content
     parts.append('</fieldset>')  # Close iNews fieldset
 
+    # CasparCG Module
+    casparcg_enabled = "checked" if CONFIG.enable_casparcg else ""
+    casparcg_display = "block" if CONFIG.enable_casparcg else "none"
+
+    parts.append('<fieldset class="module-card"><legend>CasparCG Control</legend>')
+    parts.append('<div class="module-header">')
+    parts.append('<p class="module-title">CasparCG Media Player</p>')
+    parts.append('<label class="toggle-switch"><input type="checkbox" id="casparcg-enabled" ' + casparcg_enabled + ' onchange="toggleCasparCGModule()" /><span class="toggle-slider"></span></label>')
+    parts.append('</div>')
+    parts.append('<p style="color: #8b949e; margin-bottom: 16px;">Control CasparCG media playback with automatic media discovery and HTTP command URLs.</p>')
+
+    # CasparCG content container
+    parts.append(f'<div id="casparcg-content" style="display: {casparcg_display};">')
+
+    # Connection settings
+    parts.append('<div style="display: grid; grid-template-columns: 2fr 1fr auto auto; gap: 12px; margin-bottom: 16px;">')
+    parts.append(f'<input type="text" id="casparcg-host" value="{CONFIG.casparcg_host}" placeholder="CasparCG Host" style="padding: 10px; background: #1e1e1e; border: 1px solid #3d3d3d; border-radius: 6px; color: #fff; font-size: 13px;" />')
+    parts.append(f'<input type="number" id="casparcg-port" value="{CONFIG.casparcg_port}" placeholder="Port" style="padding: 10px; background: #1e1e1e; border: 1px solid #3d3d3d; border-radius: 6px; color: #fff; font-size: 13px;" />')
+    parts.append('<button type="button" onclick="saveCasparCGConfig()">Save</button>')
+    parts.append('<button type="button" class="secondary" onclick="testCasparCGConnection()">Test</button>')
+    parts.append('</div>')
+    parts.append('<span id="casparcg-connection-status" class="status idle"></span>')
+
+    # Channel and Layer selection
+    parts.append('<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 16px 0;">')
+    parts.append('<div>')
+    parts.append('<label style="display: block; margin-bottom: 6px; font-size: 12px; color: #8b949e;">Channel</label>')
+    parts.append('<select id="casparcg-channel" style="width: 100%; padding: 10px; background: #1e1e1e; border: 1px solid #3d3d3d; border-radius: 6px; color: #fff; font-size: 13px;">')
+    for i in range(1, 11):
+        parts.append(f'<option value="{i}">Channel {i}</option>')
+    parts.append('</select>')
+    parts.append('</div>')
+    parts.append('<div>')
+    parts.append('<label style="display: block; margin-bottom: 6px; font-size: 12px; color: #8b949e;">Layer</label>')
+    parts.append('<select id="casparcg-layer" style="width: 100%; padding: 10px; background: #1e1e1e; border: 1px solid #3d3d3d; border-radius: 6px; color: #fff; font-size: 13px;">')
+    for i in range(0, 20):
+        parts.append(f'<option value="{i}">Layer {i}</option>')
+    parts.append('</select>')
+    parts.append('</div>')
+    parts.append('</div>')
+
+    # Discover Media button
+    parts.append('<div class="btn-row" style="margin-bottom: 16px;">')
+    parts.append('<button type="button" onclick="discoverCasparCGMedia()">Discover Media</button>')
+    parts.append('<span id="casparcg-discover-status" class="status idle"></span>')
+    parts.append('</div>')
+
+    # Media list with HTTP commands
+    parts.append('<div id="casparcg-media-list" style="margin-top: 16px; max-height: 500px; overflow-y: auto;"></div>')
+
+    parts.append('</div>')  # Close casparcg-content
+    parts.append('</fieldset>')  # Close CasparCG fieldset
+
     # JavaScript - use a list and join with newlines
     js_lines = [
         "<script>",
@@ -4239,6 +4554,109 @@ def modules_page(request: Request):
         '  const status = document.getElementById("inews-status");',
         '  status.textContent = "";',
         '  status.className = "status idle";',
+        "}",
+        "",
+        "// CasparCG Module Functions",
+        "async function toggleCasparCGModule() {",
+        '  const enabled = document.getElementById("casparcg-enabled").checked;',
+        '  const content = document.getElementById("casparcg-content");',
+        '  await postJSON("/config/module/casparcg", { enabled });',
+        '  content.style.display = enabled ? "block" : "none";',
+        "}",
+        "",
+        "async function saveCasparCGConfig() {",
+        '  const host = document.getElementById("casparcg-host").value;',
+        '  const port = parseInt(document.getElementById("casparcg-port").value);',
+        '  const status = document.getElementById("casparcg-connection-status");',
+        "",
+        '  status.textContent = "Saving...";',
+        '  status.className = "status";',
+        "",
+        "  try {",
+        '    await postJSON("/config/casparcg", { host, port });',
+        '    status.textContent = "Settings saved";',
+        '    status.className = "status success";',
+        "    setTimeout(() => { status.className = 'status idle'; status.textContent = ''; }, 3000);",
+        "  } catch (e) {",
+        '    status.textContent = "Failed to save: " + e.message;',
+        '    status.className = "status error";',
+        "  }",
+        "}",
+        "",
+        "async function testCasparCGConnection() {",
+        '  const status = document.getElementById("casparcg-connection-status");',
+        '  status.textContent = "Testing connection...";',
+        '  status.className = "status";',
+        "",
+        "  try {",
+        '    const res = await fetch("/casparcg/test");',
+        "    const data = await res.json();",
+        "    if (data.ok) {",
+        '      status.textContent = "✓ Connected to CasparCG";',
+        '      status.className = "status success";',
+        "    } else {",
+        '      status.textContent = "✗ " + (data.error || "Connection failed");',
+        '      status.className = "status error";',
+        "    }",
+        "  } catch (e) {",
+        '    status.textContent = "✗ Connection failed: " + e.message;',
+        '    status.className = "status error";',
+        "  }",
+        "}",
+        "",
+        "async function discoverCasparCGMedia() {",
+        '  const status = document.getElementById("casparcg-discover-status");',
+        '  status.textContent = "Discovering media...";',
+        '  status.className = "status";',
+        "",
+        "  try {",
+        '    const res = await fetch("/casparcg/media");',
+        "    const data = await res.json();",
+        "",
+        "    if (data.ok && data.media) {",
+        '      status.textContent = `Found ${data.count} media files`;',
+        '      status.className = "status success";',
+        "      displayCasparCGMedia(data.media);",
+        "    } else {",
+        '      status.textContent = "Error: " + (data.error || "Failed to discover media");',
+        '      status.className = "status error";',
+        "    }",
+        "  } catch (e) {",
+        '    status.textContent = "Error: " + e.message;',
+        '    status.className = "status error";',
+        "  }",
+        "}",
+        "",
+        "function displayCasparCGMedia(media) {",
+        '  const container = document.getElementById("casparcg-media-list");',
+        '  const channel = document.getElementById("casparcg-channel").value;',
+        '  const layer = document.getElementById("casparcg-layer").value;',
+        "  const baseUrl = window.location.origin;",
+        "",
+        "  if (!media || media.length === 0) {",
+        '    container.innerHTML = "<p style=\'color: #8b949e; text-align: center; padding: 20px;\'>No media files found</p>";',
+        "    return;",
+        "  }",
+        "",
+        "  let html = '';",
+        "  media.forEach(item => {",
+        "    const encodedClip = encodeURIComponent(item.filename);",
+        "    const playUrl = `${baseUrl}/casparcg/play?channel=${channel}&layer=${layer}&clip=${encodedClip}`;",
+        "    const loadUrl = `${baseUrl}/casparcg/load?channel=${channel}&layer=${layer}&clip=${encodedClip}`;",
+        "",
+        "    html += '<div style=\"background: #1e1e1e; border: 1px solid #3d3d3d; border-radius: 6px; padding: 12px; margin-bottom: 8px;\">';",
+        "    html += `<div style=\"font-weight: 600; margin-bottom: 8px; color: #fff;\">${item.filename}</div>`;",
+        "    html += `<div style=\"font-size: 11px; color: #8b949e; margin-bottom: 8px;\">Type: ${item.type} | Size: ${item.size}</div>`;",
+        "",
+        "    // HTTP command URLs",
+        "    html += '<div style=\"display: flex; gap: 8px; flex-wrap: wrap;\">';",
+        "    html += `<div class=\"cmd-url\" onclick=\"copyToClipboard('${playUrl.replace(/'/g, \"\\\\'\")}')\">PLAY: ${playUrl}</div>`;",
+        "    html += `<div class=\"cmd-url\" onclick=\"copyToClipboard('${loadUrl.replace(/'/g, \"\\\\'\")}')\">LOAD: ${loadUrl}</div>`;",
+        "    html += '</div>';",
+        "    html += '</div>';",
+        "  });",
+        "",
+        "  container.innerHTML = html;",
         "}",
     ]
     parts.append("\n".join(js_lines))
