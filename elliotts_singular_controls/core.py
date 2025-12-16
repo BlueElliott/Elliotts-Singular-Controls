@@ -1650,7 +1650,7 @@ class SingularItem(BaseModel):
 # ================== 5. HTML helpers ==================
 
 def _nav_html(active: str = "") -> str:
-    pages = [("Home", "/"), ("Commands", "/commands"), ("Modules", "/modules"), ("Settings", "/settings")]
+    pages = [("Home", "/"), ("Commands", "/commands"), ("Modules", "/modules"), ("Config", "/config/page"), ("Settings", "/settings")]
     parts = ['<div class="nav">']
     for name, href in pages:
         cls = ' class="active"' if active.lower() == name.lower() else ''
@@ -2727,6 +2727,107 @@ def check_version():
             "latest": None,
             "up_to_date": True,
             "message": f"Version check failed: {str(e)}",
+        }
+
+
+@app.get("/config/full")
+def get_configuration():
+    """Get current configuration from config manager."""
+    from elliotts_singular_controls.config_manager import get_config
+    config_mgr = get_config()
+    return config_mgr.get()
+
+
+@app.post("/config/full")
+def update_configuration(updates: dict):
+    """Update configuration settings."""
+    from elliotts_singular_controls.config_manager import get_config
+    config_mgr = get_config()
+
+    try:
+        success = config_mgr.update(updates, save=True)
+        if success:
+            return {
+                "ok": True,
+                "message": "Configuration updated successfully",
+                "config": config_mgr.get()
+            }
+        else:
+            return {
+                "ok": False,
+                "message": "Failed to save configuration"
+            }
+    except Exception as e:
+        logger.error(f"Error updating configuration: {e}")
+        return {
+            "ok": False,
+            "message": f"Error: {str(e)}"
+        }
+
+
+@app.post("/config/reset")
+def reset_configuration():
+    """Reset configuration to defaults."""
+    from elliotts_singular_controls.config_manager import get_config
+    config_mgr = get_config()
+
+    try:
+        success = config_mgr.reset(save=True)
+        if success:
+            return {
+                "ok": True,
+                "message": "Configuration reset to defaults",
+                "config": config_mgr.get()
+            }
+        else:
+            return {
+                "ok": False,
+                "message": "Failed to reset configuration"
+            }
+    except Exception as e:
+        logger.error(f"Error resetting configuration: {e}")
+        return {
+            "ok": False,
+            "message": f"Error: {str(e)}"
+        }
+
+
+@app.get("/config/modules")
+def get_modules_config():
+    """Get module configuration."""
+    from elliotts_singular_controls.config_manager import get_config
+    config_mgr = get_config()
+    return config_mgr.get("modules")
+
+
+@app.post("/config/modules/{module}/toggle")
+def toggle_module(module: str):
+    """Toggle a module on/off."""
+    from elliotts_singular_controls.config_manager import get_config
+    config_mgr = get_config()
+
+    try:
+        current = config_mgr.is_module_enabled(module)
+        new_state = not current
+        success = config_mgr.set(f"modules.{module}.enabled", new_state, save=True)
+
+        if success:
+            return {
+                "ok": True,
+                "module": module,
+                "enabled": new_state,
+                "message": f"Module {module} {'enabled' if new_state else 'disabled'}"
+            }
+        else:
+            return {
+                "ok": False,
+                "message": "Failed to toggle module"
+            }
+    except Exception as e:
+        logger.error(f"Error toggling module {module}: {e}")
+        return {
+            "ok": False,
+            "message": f"Error: {str(e)}"
         }
 
 
@@ -6108,6 +6209,205 @@ def commands_page(request: Request):
     parts.append('  document.getElementById("cmd-sort").addEventListener("change", renderCommands);')
     parts.append("});")
     parts.append("loadCommands();")
+    parts.append("</script>")
+    parts.append("</body></html>")
+    return HTMLResponse("".join(parts))
+
+
+@app.get("/config/page", response_class=HTMLResponse)
+def config_page():
+    """Configuration management page."""
+    parts: List[str] = []
+    parts.append("<!DOCTYPE html>")
+    parts.append("<html><head>")
+    parts.append("<title>Configuration - Elliott's Singular Controls</title>")
+    parts.append(_base_style())
+    parts.append("<style>")
+    parts.append("  .module-card { background: #2d2d2d; border: 1px solid #3d3d3d; border-radius: 8px; padding: 16px; margin-bottom: 12px; }")
+    parts.append("  .module-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }")
+    parts.append("  .module-name { font-size: 16px; font-weight: 600; }")
+    parts.append("  .module-description { color: #888; font-size: 13px; margin-bottom: 12px; }")
+    parts.append("  .module-settings { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px; margin-top: 12px; padding-top: 12px; border-top: 1px solid #3d3d3d; }")
+    parts.append("  .module-settings label { display: block; font-size: 12px; color: #888; margin-bottom: 4px; }")
+    parts.append("  .module-settings input { width: 100%; }")
+    parts.append("  .toggle-switch { position: relative; display: inline-block; width: 50px; height: 26px; }")
+    parts.append("  .toggle-switch input { opacity: 0; width: 0; height: 0; }")
+    parts.append("  .toggle-slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #3d3d3d; transition: .3s; border-radius: 26px; }")
+    parts.append("  .toggle-slider:before { position: absolute; content: ''; height: 18px; width: 18px; left: 4px; bottom: 4px; background-color: white; transition: .3s; border-radius: 50%; }")
+    parts.append("  .toggle-switch input:checked + .toggle-slider { background-color: #00bcd4; }")
+    parts.append("  .toggle-switch input:checked + .toggle-slider:before { transform: translateX(24px); }")
+    parts.append("  .action-buttons { display: flex; gap: 12px; margin-top: 24px; }")
+    parts.append("  .module-settings-container { display: none; }")
+    parts.append("  .module-settings-container.show { display: block; }")
+    parts.append("</style>")
+    parts.append("</head><body>")
+    parts.append(_nav_html("Config"))
+    parts.append("<h1>Configuration</h1>")
+    parts.append("<p>Manage module settings and enable/disable features.</p>")
+
+    parts.append('<fieldset><legend>Modules</legend>')
+    parts.append('<div id="modules-container"><p style="color: #888;">Loading modules...</p></div>')
+    parts.append('</fieldset>')
+
+    parts.append('<div class="action-buttons">')
+    parts.append('<button type="button" id="btn-save" class="primary">Save All Changes</button>')
+    parts.append('<button type="button" id="btn-reset" class="secondary">Reset to Defaults</button>')
+    parts.append('</div>')
+
+    # JavaScript
+    parts.append("<script>")
+    parts.append("let config = null;")
+    parts.append("")
+
+    # XHR helper
+    parts.append("function xhr(method, url, data, callback) {")
+    parts.append("  var req = new XMLHttpRequest();")
+    parts.append("  req.open(method, url, true);")
+    parts.append("  req.onload = function() {")
+    parts.append("    var json = null;")
+    parts.append("    try { json = JSON.parse(req.responseText); } catch(e) {}")
+    parts.append("    callback(req.status, json);")
+    parts.append("  };")
+    parts.append("  req.onerror = function() { callback(0, null); };")
+    parts.append("  if (data) {")
+    parts.append("    req.setRequestHeader('Content-Type', 'application/json');")
+    parts.append("    req.send(JSON.stringify(data));")
+    parts.append("  } else {")
+    parts.append("    req.send();")
+    parts.append("  }")
+    parts.append("}")
+    parts.append("")
+
+    # Load modules
+    parts.append("function loadModules() {")
+    parts.append("  xhr('GET', '/config/full', null, function(status, response) {")
+    parts.append("    if (status === 200 && response) {")
+    parts.append("      config = response;")
+    parts.append("      renderModules();")
+    parts.append("    } else {")
+    parts.append("      document.getElementById('modules-container').innerHTML = '<p style=\"color: #ef4444;\">Failed to load configuration</p>';")
+    parts.append("    }")
+    parts.append("  });")
+    parts.append("}")
+    parts.append("")
+
+    # Render modules
+    parts.append("function renderModules() {")
+    parts.append("  const container = document.getElementById('modules-container');")
+    parts.append("  const modules = config.modules;")
+    parts.append("  let html = '';")
+    parts.append("  ")
+    parts.append("  for (const [key, module] of Object.entries(modules)) {")
+    parts.append("    const enabled = module.enabled || false;")
+    parts.append("    const hasSettings = module.settings && Object.keys(module.settings).length > 0;")
+    parts.append("    ")
+    parts.append("    html += '<div class=\"module-card\">';")
+    parts.append("    html += '  <div class=\"module-header\">';")
+    parts.append("    html += '    <div>';")
+    parts.append("    html += '      <div class=\"module-name\">' + module.name + '</div>';")
+    parts.append("    html += '      <div class=\"module-description\">' + module.description + '</div>';")
+    parts.append("    html += '    </div>';")
+    parts.append("    html += '    <label class=\"toggle-switch\">';")
+    parts.append("    html += '      <input type=\"checkbox\" data-module=\"' + key + '\" ' + (enabled ? 'checked' : '') + '>';")
+    parts.append("    html += '      <span class=\"toggle-slider\"></span>';")
+    parts.append("    html += '    </label>';")
+    parts.append("    html += '  </div>';")
+    parts.append("    ")
+    parts.append("    if (hasSettings) {")
+    parts.append("      html += '  <div class=\"module-settings-container' + (enabled ? ' show' : '') + '\" id=\"settings-' + key + '\">';")
+    parts.append("      html += '    <div class=\"module-settings\">';")
+    parts.append("      for (const [settingKey, settingValue] of Object.entries(module.settings)) {")
+    parts.append("        html += '      <div>';")
+    parts.append("        html += '        <label>' + settingKey + '</label>';")
+    parts.append("        html += '        <input type=\"text\" data-module=\"' + key + '\" data-setting=\"' + settingKey + '\" value=\"' + (settingValue || '') + '\" />';")
+    parts.append("        html += '      </div>';")
+    parts.append("      }")
+    parts.append("      html += '    </div>';")
+    parts.append("      html += '  </div>';")
+    parts.append("    }")
+    parts.append("    html += '</div>';")
+    parts.append("  }")
+    parts.append("  ")
+    parts.append("  container.innerHTML = html;")
+    parts.append("  ")
+    parts.append("  // Add toggle listeners")
+    parts.append("  document.querySelectorAll('.toggle-switch input').forEach(function(toggle) {")
+    parts.append("    toggle.addEventListener('change', function() {")
+    parts.append("      const module = this.dataset.module;")
+    parts.append("      const enabled = this.checked;")
+    parts.append("      const settingsContainer = document.getElementById('settings-' + module);")
+    parts.append("      if (settingsContainer) {")
+    parts.append("        if (enabled) {")
+    parts.append("          settingsContainer.classList.add('show');")
+    parts.append("        } else {")
+    parts.append("          settingsContainer.classList.remove('show');")
+    parts.append("        }")
+    parts.append("      }")
+    parts.append("      config.modules[module].enabled = enabled;")
+    parts.append("    });")
+    parts.append("  });")
+    parts.append("  ")
+    parts.append("  // Add setting input listeners")
+    parts.append("  document.querySelectorAll('.module-settings input').forEach(function(input) {")
+    parts.append("    input.addEventListener('change', function() {")
+    parts.append("      const module = this.dataset.module;")
+    parts.append("      const setting = this.dataset.setting;")
+    parts.append("      config.modules[module].settings[setting] = this.value;")
+    parts.append("    });")
+    parts.append("  });")
+    parts.append("}")
+    parts.append("")
+
+    # Save
+    parts.append("function saveConfig() {")
+    parts.append("  const btn = document.getElementById('btn-save');")
+    parts.append("  btn.disabled = true;")
+    parts.append("  btn.textContent = 'Saving...';")
+    parts.append("  ")
+    parts.append("  xhr('POST', '/config/full', config, function(status, response) {")
+    parts.append("    btn.disabled = false;")
+    parts.append("    if (status === 200 && response && response.ok) {")
+    parts.append("      btn.textContent = 'Saved ✓';")
+    parts.append("      setTimeout(function() { btn.textContent = 'Save All Changes'; }, 2000);")
+    parts.append("    } else {")
+    parts.append("      btn.textContent = 'Save Failed';")
+    parts.append("      setTimeout(function() { btn.textContent = 'Save All Changes'; }, 2000);")
+    parts.append("    }")
+    parts.append("  });")
+    parts.append("}")
+    parts.append("")
+
+    # Reset
+    parts.append("function resetConfig() {")
+    parts.append("  if (!confirm('Reset all configuration to defaults? This cannot be undone.')) return;")
+    parts.append("  ")
+    parts.append("  const btn = document.getElementById('btn-reset');")
+    parts.append("  btn.disabled = true;")
+    parts.append("  btn.textContent = 'Resetting...';")
+    parts.append("  ")
+    parts.append("  xhr('POST', '/config/reset', null, function(status, response) {")
+    parts.append("    btn.disabled = false;")
+    parts.append("    if (status === 200 && response && response.ok) {")
+    parts.append("      btn.textContent = 'Reset ✓';")
+    parts.append("      setTimeout(function() { ")
+    parts.append("        btn.textContent = 'Reset to Defaults';")
+    parts.append("        loadModules();")
+    parts.append("      }, 1000);")
+    parts.append("    } else {")
+    parts.append("      btn.textContent = 'Reset Failed';")
+    parts.append("      setTimeout(function() { btn.textContent = 'Reset to Defaults'; }, 2000);")
+    parts.append("    }")
+    parts.append("  });")
+    parts.append("}")
+    parts.append("")
+
+    # Event listeners
+    parts.append("document.getElementById('btn-save').addEventListener('click', saveConfig);")
+    parts.append("document.getElementById('btn-reset').addEventListener('click', resetConfig);")
+    parts.append("")
+
+    # Initialize
+    parts.append("loadModules();")
     parts.append("</script>")
     parts.append("</body></html>")
     return HTMLResponse("".join(parts))
