@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "elliotts-singular-controls"
-version = "1.0.14"
+version = "1.1.6"
 description = "Elliott's Singular Controls - Helper UI and HTTP API for Singular.live"
 readme = "README.md"
 requires-python = ">=3.8"
