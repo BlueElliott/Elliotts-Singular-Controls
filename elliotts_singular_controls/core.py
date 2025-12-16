@@ -13,6 +13,8 @@ from html import escape as html_escape
 from datetime import datetime
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from fastapi import FastAPI, Query, HTTPException, Request, Body
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.routing import APIRoute
@@ -67,6 +69,221 @@ def setup_crash_handler():
 
 # Initialize crash handler
 setup_crash_handler()
+
+
+# ================== ENHANCED ERROR HANDLING ==================
+
+class ErrorResponse(BaseModel):
+    """Standardized error response format."""
+    success: bool = False
+    error: str
+    error_type: str
+    module: Optional[str] = None
+    timestamp: str
+    details: Optional[Dict[str, Any]] = None
+
+
+def create_error_response(
+    error: Exception,
+    module: str = None,
+    context: str = "",
+    details: Dict[str, Any] = None
+) -> ErrorResponse:
+    """
+    Create a standardized error response.
+
+    Args:
+        error: The exception that occurred
+        module: Module name (e.g., "tricaster", "cuez", "singular")
+        context: Additional context about what was being done
+        details: Extra details to include in response
+    """
+    error_type = type(error).__name__
+    error_msg = str(error)
+
+    if context:
+        error_msg = f"{context}: {error_msg}"
+
+    # Log the error
+    logger.error(f"[{module or 'unknown'}] {error_msg}", exc_info=True)
+
+    # Log to crash file for serious errors
+    if not isinstance(error, (HTTPException, requests.Timeout)):
+        log_crash(error, f"{module}: {context}" if context else module or "")
+
+    return ErrorResponse(
+        error=error_msg,
+        error_type=error_type,
+        module=module,
+        timestamp=datetime.now().isoformat(),
+        details=details or {}
+    )
+
+
+def create_requests_session_with_retry(
+    retries: int = 3,
+    backoff_factor: float = 0.3,
+    status_forcelist: Tuple[int, ...] = (500, 502, 503, 504),
+    timeout: int = 10
+) -> requests.Session:
+    """
+    Create a requests session with automatic retry logic.
+
+    Args:
+        retries: Number of retries for failed requests
+        backoff_factor: Exponential backoff factor (delay = backoff_factor * (2 ** retry_number))
+        status_forcelist: HTTP status codes to retry on
+        timeout: Default timeout in seconds
+
+    Returns:
+        Configured requests session with retry logic
+    """
+    session = requests.Session()
+    retry = Retry(
+        total=retries,
+        read=retries,
+        connect=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=status_forcelist,
+        allowed_methods=["GET", "POST", "PUT", "PATCH", "DELETE"]  # Retry on all methods
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+# Global session with retry logic for all HTTP requests
+_retry_session = create_requests_session_with_retry()
+
+
+def safe_http_request(
+    method: str,
+    url: str,
+    module: str,
+    context: str = "",
+    timeout: int = 10,
+    **kwargs
+) -> requests.Response:
+    """
+    Make an HTTP request with standardized error handling and retry logic.
+
+    Args:
+        method: HTTP method (GET, POST, PUT, PATCH, DELETE)
+        url: URL to request
+        module: Module name for error tracking
+        context: Description of what's being done
+        timeout: Request timeout in seconds
+        **kwargs: Additional arguments to pass to requests
+
+    Returns:
+        Response object
+
+    Raises:
+        HTTPException: On request failure with standardized error message
+    """
+    try:
+        response = _retry_session.request(method, url, timeout=timeout, **kwargs)
+        response.raise_for_status()
+        return response
+    except requests.Timeout as e:
+        error_resp = create_error_response(
+            e,
+            module=module,
+            context=context or f"{method} {url}",
+            details={"url": url, "timeout": timeout}
+        )
+        raise HTTPException(
+            status_code=504,
+            detail=error_resp.model_dump()
+        )
+    except requests.ConnectionError as e:
+        error_resp = create_error_response(
+            e,
+            module=module,
+            context=context or f"{method} {url}",
+            details={"url": url, "error": "Connection failed - is the server running?"}
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=error_resp.model_dump()
+        )
+    except requests.HTTPError as e:
+        status_code = e.response.status_code if e.response else 500
+        error_resp = create_error_response(
+            e,
+            module=module,
+            context=context or f"{method} {url}",
+            details={"url": url, "status_code": status_code}
+        )
+        raise HTTPException(
+            status_code=status_code,
+            detail=error_resp.model_dump()
+        )
+    except requests.RequestException as e:
+        error_resp = create_error_response(
+            e,
+            module=module,
+            context=context or f"{method} {url}",
+            details={"url": url}
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=error_resp.model_dump()
+        )
+
+
+# Connection health tracking
+class ConnectionHealth:
+    """Track connection health for each module."""
+    def __init__(self):
+        self._health: Dict[str, Dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+
+    async def update(self, module: str, success: bool, error: str = None):
+        """Update health status for a module."""
+        async with self._lock:
+            if module not in self._health:
+                self._health[module] = {
+                    "status": "unknown",
+                    "last_success": None,
+                    "last_failure": None,
+                    "last_error": None,
+                    "success_count": 0,
+                    "failure_count": 0
+                }
+
+            now = datetime.now().isoformat()
+            if success:
+                self._health[module]["status"] = "healthy"
+                self._health[module]["last_success"] = now
+                self._health[module]["success_count"] += 1
+                self._health[module]["last_error"] = None
+            else:
+                self._health[module]["status"] = "error"
+                self._health[module]["last_failure"] = now
+                self._health[module]["failure_count"] += 1
+                self._health[module]["last_error"] = error
+
+    async def get(self, module: str = None) -> Dict[str, Any]:
+        """Get health status for a module or all modules."""
+        async with self._lock:
+            if module:
+                return self._health.get(module, {"status": "unknown"})
+            return self._health.copy()
+
+    async def clear(self, module: str = None):
+        """Clear health tracking for a module or all modules."""
+        async with self._lock:
+            if module:
+                self._health.pop(module, None)
+            else:
+                self._health.clear()
+
+
+# Global health tracker
+_connection_health = ConnectionHealth()
+
 
 # ================== 0. PATHS & VERSION ==================
 
@@ -352,15 +569,23 @@ def fetch_all_line_statuses() -> Dict[str, str]:
     if not CONFIG.enable_tfl:
         raise HTTPException(400, "TfL integration is disabled in settings")
     try:
-        r = requests.get(TFL_URL, params=tfl_params(), timeout=10)
-        r.raise_for_status()
+        r = safe_http_request(
+            "GET",
+            TFL_URL,
+            module="tfl",
+            context="Fetching line statuses",
+            params=tfl_params(),
+            timeout=10
+        )
         out: Dict[str, str] = {}
         for line in r.json():
             out[line["name"]] = line.get("lineStatuses", [{}])[0].get("statusSeverityDescription", "Unknown")
         return out
-    except requests.RequestException as e:
-        logger.error("TfL API request failed: %s", e)
-        raise HTTPException(503, f"TfL API request failed: {str(e)}")
+    except HTTPException:
+        raise  # Re-raise HTTP exceptions from safe_http_request
+    except Exception as e:
+        error_resp = create_error_response(e, module="tfl", context="Parsing TfL response")
+        raise HTTPException(500, detail=error_resp.model_dump())
 
 
 # ================== TRICASTER API HELPERS ==================
@@ -384,16 +609,16 @@ def tricaster_request(endpoint: str, method: str = "GET", data: str = None) -> r
     if method == "POST" and data:
         headers["Content-Type"] = "text/xml"
 
-    try:
-        if method == "GET":
-            resp = requests.get(url, auth=auth, headers=headers, timeout=6)
-        else:
-            resp = requests.post(url, auth=auth, headers=headers, data=data, timeout=6)
-        resp.raise_for_status()
-        return resp
-    except requests.RequestException as e:
-        logger.error("TriCaster request failed: %s", e)
-        raise HTTPException(503, f"TriCaster request failed: {str(e)}")
+    return safe_http_request(
+        method,
+        url,
+        module="tricaster",
+        context=f"TriCaster {method} {endpoint}",
+        auth=auth,
+        headers=headers,
+        data=data if method == "POST" else None,
+        timeout=6
+    )
 
 
 def tricaster_shortcut(name: str, params: Dict[str, str] = None) -> Dict[str, Any]:
@@ -585,8 +810,7 @@ def _get_ddr_duration_and_fps(ddr_index: int) -> Tuple[float, Optional[float]]:
 def _get_singular_model(token: str) -> list:
     """Fetch the Singular control app model."""
     url = f"{SINGULAR_API_BASE}/controlapps/{token}/model"
-    resp = requests.get(url, timeout=10)
-    resp.raise_for_status()
+    resp = safe_http_request("GET", url, module="singular", context="Fetching control app model", timeout=10)
     return resp.json()
 
 
@@ -636,8 +860,7 @@ def _patch_singular_fields(token: str, field_values: Dict[str, Any]) -> Dict[str
     body = [{"subCompositionId": sub_id, "payload": payload} for sub_id, payload in grouped.items()]
 
     url = f"{SINGULAR_API_BASE}/controlapps/{token}/control"
-    resp = requests.patch(url, json=body, timeout=10)
-    resp.raise_for_status()
+    resp = safe_http_request("PATCH", url, module="singular", context="Updating control fields", json=body, timeout=10)
     try:
         return resp.json()
     except Exception:
@@ -739,25 +962,28 @@ def send_to_datastream(payload: Dict[str, Any]):
         raise HTTPException(400, "No Singular data stream URL configured")
     resp = None
     try:
-        resp = requests.put(
+        resp = safe_http_request(
+            "PUT",
             CONFIG.singular_stream_url,
+            module="singular",
+            context="Sending data to stream",
             json=payload,
             headers={"Content-Type": "application/json"},
             timeout=10,
         )
-        resp.raise_for_status()
         return {
             "stream_url": CONFIG.singular_stream_url,
             "status": resp.status_code,
             "response": resp.text,
         }
-    except requests.RequestException as e:
+    except HTTPException as e:
         logger.exception("Datastream PUT failed")
+        error_detail = e.detail if isinstance(e.detail, dict) else {"error": str(e.detail)}
         return {
             "stream_url": CONFIG.singular_stream_url,
-            "status": resp.status_code if resp is not None else 0,
-            "response": resp.text if resp is not None else "",
-            "error": str(e),
+            "status": e.status_code,
+            "response": "",
+            "error": error_detail.get("error", str(e.detail)),
         }
 
 
@@ -767,18 +993,20 @@ def ctrl_patch(items: list, token: str):
         raise HTTPException(400, "No Singular control app token provided")
     ctrl_control = f"{SINGULAR_API_BASE}/controlapps/{token}/control"
     try:
-        resp = requests.patch(
+        resp = safe_http_request(
+            "PATCH",
             ctrl_control,
+            module="singular",
+            context="Patching control app",
             json=items,
             headers={"Content-Type": "application/json"},
             timeout=10,
         )
-        resp.raise_for_status()
         log_event("Control PATCH", f"{ctrl_control} items={len(items)}")
         return resp
-    except requests.RequestException as e:
+    except HTTPException:
         logger.exception("Control PATCH failed")
-        raise HTTPException(503, f"Control PATCH failed: {str(e)}")
+        raise  # Re-raise HTTP exceptions from safe_http_request
 
 
 def now_ms_float() -> float:
@@ -814,20 +1042,14 @@ def cuez_request(endpoint: str, method: str = "GET", json_data: dict = None) -> 
 
     url = f"{_cuez_base_url()}{endpoint}"
 
-    try:
-        if method == "GET":
-            resp = requests.get(url, timeout=5)
-        elif method == "POST":
-            resp = requests.post(url, json=json_data, timeout=5)
-        elif method == "PUT":
-            resp = requests.put(url, json=json_data, timeout=5)
-        else:
-            resp = requests.request(method, url, json=json_data, timeout=5)
-        resp.raise_for_status()
-        return resp
-    except requests.RequestException as e:
-        logger.error("Cuez request failed: %s", e)
-        raise HTTPException(503, f"Cuez request failed: {str(e)}")
+    return safe_http_request(
+        method,
+        url,
+        module="cuez",
+        context=f"Cuez {method} {endpoint}",
+        json=json_data if json_data else None,
+        timeout=5
+    )
 
 
 def cuez_test_connection() -> Dict[str, Any]:
@@ -839,12 +1061,14 @@ def cuez_test_connection() -> Dict[str, Any]:
     test_url = f"{base_url}/api/app/webconnection"
     try:
         # Use the official API connection check endpoint
-        resp = requests.get(test_url, timeout=5)
-        resp.raise_for_status()
+        resp = safe_http_request("GET", test_url, module="cuez", context="Testing connection", timeout=5)
         if resp.status_code == 200:
             return {"ok": True, "host": CONFIG.cuez_host, "port": CONFIG.cuez_port, "url": base_url}
         return {"ok": False, "error": f"Unexpected status: {resp.status_code}"}
-    except requests.RequestException as e:
+    except HTTPException as e:
+        error_detail = e.detail if isinstance(e.detail, dict) else {"error": str(e.detail)}
+        return {"ok": False, "error": error_detail.get("error", str(e.detail)), "url": test_url}
+    except Exception as e:
         return {"ok": False, "error": str(e), "url": test_url}
 
 
@@ -1579,6 +1803,31 @@ def _base_style() -> str:
                  f"background: {accent}; color: #fff; border-radius: 50%; text-decoration: none; font-size: 14px; "
                  f"transition: all 0.2s; }}")
     lines.append(f"  .play-btn:hover {{ background: {accent_hover}; transform: scale(1.1); box-shadow: 0 2px 8px {accent}60; }}")
+
+    # Toast notification system
+    lines.append(f"  /* Toast Notification System */")
+    lines.append(f"  #toast-container {{ position: fixed; top: 80px; right: 20px; z-index: 9999; display: flex; flex-direction: column; gap: 10px; max-width: 400px; }}")
+    lines.append(f"  .toast {{ display: flex; align-items: flex-start; gap: 12px; padding: 16px 20px; background: {card_bg}; "
+                 f"border: 1px solid {border}; border-left-width: 4px; border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,0.3); "
+                 f"animation: slideIn 0.3s ease-out; transition: opacity 0.3s, transform 0.3s; }}")
+    lines.append(f"  .toast.removing {{ opacity: 0; transform: translateX(400px); }}")
+    lines.append(f"  .toast.success {{ border-left-color: #22c55e; }}")
+    lines.append(f"  .toast.error {{ border-left-color: #ef4444; }}")
+    lines.append(f"  .toast.warning {{ border-left-color: #f59e0b; }}")
+    lines.append(f"  .toast.info {{ border-left-color: {accent}; }}")
+    lines.append(f"  .toast-icon {{ font-size: 20px; flex-shrink: 0; }}")
+    lines.append(f"  .toast.success .toast-icon {{ color: #22c55e; }}")
+    lines.append(f"  .toast.error .toast-icon {{ color: #ef4444; }}")
+    lines.append(f"  .toast.warning .toast-icon {{ color: #f59e0b; }}")
+    lines.append(f"  .toast.info .toast-icon {{ color: {accent}; }}")
+    lines.append(f"  .toast-content {{ flex: 1; }}")
+    lines.append(f"  .toast-title {{ font-weight: 600; font-size: 14px; margin-bottom: 4px; color: {fg}; }}")
+    lines.append(f"  .toast-message {{ font-size: 13px; color: {text_muted}; line-height: 1.4; }}")
+    lines.append(f"  .toast-close {{ cursor: pointer; color: {text_muted}; font-size: 20px; line-height: 1; padding: 0 4px; "
+                 f"transition: color 0.2s; flex-shrink: 0; }}")
+    lines.append(f"  .toast-close:hover {{ color: {fg}; }}")
+    lines.append(f"  @keyframes slideIn {{ from {{ opacity: 0; transform: translateX(400px); }} to {{ opacity: 1; transform: translateX(0); }} }}")
+
     lines.append("</style>")
     return "\n".join(lines)
 
@@ -2430,18 +2679,13 @@ def check_version():
     """Check for updates against GitHub releases."""
     current = _runtime_version()
     try:
-        resp = requests.get(
+        resp = safe_http_request(
+            "GET",
             "https://api.github.com/repos/BlueElliott/Singular-Tweaks/releases/latest",
+            module="version_check",
+            context="Checking for updates",
             timeout=5
         )
-        if resp.status_code == 404:
-            return {
-                "current": current,
-                "latest": None,
-                "up_to_date": True,
-                "message": "Repository is private or has no public releases",
-            }
-        resp.raise_for_status()
         data = resp.json()
         latest = data.get("tag_name", "unknown")
         release_url = data.get("html_url", "")
@@ -2564,6 +2808,20 @@ def singular_ping(app_name: Optional[str] = Query(None, description="App name to
 @app.get("/health")
 def health():
     return {"status": "ok", "version": _runtime_version(), "port": effective_port()}
+
+
+@app.get("/health/modules")
+async def health_modules(module: Optional[str] = Query(None, description="Specific module to check")):
+    """Get connection health status for all modules or a specific module."""
+    health_data = await _connection_health.get(module)
+    return {"success": True, "health": health_data}
+
+
+@app.post("/health/modules/{module}/clear")
+async def clear_module_health(module: str):
+    """Clear health tracking for a specific module."""
+    await _connection_health.clear(module)
+    return {"success": True, "message": f"Cleared health tracking for {module}"}
 
 
 @app.get("/status")
@@ -2726,14 +2984,13 @@ def singular_counter_control(
     body = [payload_item]
 
     try:
-        resp = requests.patch(url, json=body, timeout=10)
-        resp.raise_for_status()
+        resp = safe_http_request("PATCH", url, module="singular", context=f"Counter {action}", json=body, timeout=10)
         result = resp.json() if resp.text else {"success": True}
         log_event("Counter", f"{action}: {control_node_id} = {new_value} in {subcomposition_name or target_subcomp_id}")
         return {"ok": True, "action": action, "old_value": current_value if action != "set" else None, "new_value": new_value, "result": result}
-    except requests.RequestException as e:
-        log_event("Counter Error", str(e))
-        raise HTTPException(500, f"Failed to control counter: {str(e)}")
+    except HTTPException:
+        log_event("Counter Error", "HTTP error")
+        raise
 
 
 @app.get("/singular/button/execute")
@@ -2767,14 +3024,13 @@ def singular_button_execute(
     body = [payload_item]
 
     try:
-        resp = requests.patch(url, json=body, timeout=10)
-        resp.raise_for_status()
+        resp = safe_http_request("PATCH", url, module="singular", context="Button execute", json=body, timeout=10)
         result = resp.json() if resp.text else {"success": True}
         log_event("Button", f"executed: {control_node_id} in {subcomposition_name or subcomposition_id}")
         return {"ok": True, "result": result}
-    except requests.RequestException as e:
-        log_event("Button Error", str(e))
-        raise HTTPException(500, f"Failed to execute button: {str(e)}")
+    except HTTPException:
+        log_event("Button Error", "HTTP error")
+        raise
 
 
 @app.get("/singular/list")
@@ -3054,6 +3310,108 @@ def index():
     parts.append("  }")
     parts.append("}")
     parts.append("")
+
+    # Toast notification system
+    parts.append("// Toast Notification System")
+    parts.append("(function() {")
+    parts.append("  // Create toast container")
+    parts.append("  var container = document.createElement('div');")
+    parts.append("  container.id = 'toast-container';")
+    parts.append("  document.body.appendChild(container);")
+    parts.append("  ")
+    parts.append("  window.showToast = function(message, type, title, duration) {")
+    parts.append("    type = type || 'info';")
+    parts.append("    duration = duration || 4000;")
+    parts.append("    ")
+    parts.append("    var icons = {")
+    parts.append("      success: '✓',")
+    parts.append("      error: '✗',")
+    parts.append("      warning: '⚠',")
+    parts.append("      info: 'ℹ'")
+    parts.append("    };")
+    parts.append("    ")
+    parts.append("    var toast = document.createElement('div');")
+    parts.append("    toast.className = 'toast ' + type;")
+    parts.append("    ")
+    parts.append("    var icon = document.createElement('div');")
+    parts.append("    icon.className = 'toast-icon';")
+    parts.append("    icon.textContent = icons[type] || icons.info;")
+    parts.append("    ")
+    parts.append("    var content = document.createElement('div');")
+    parts.append("    content.className = 'toast-content';")
+    parts.append("    ")
+    parts.append("    if (title) {")
+    parts.append("      var titleEl = document.createElement('div');")
+    parts.append("      titleEl.className = 'toast-title';")
+    parts.append("      titleEl.textContent = title;")
+    parts.append("      content.appendChild(titleEl);")
+    parts.append("    }")
+    parts.append("    ")
+    parts.append("    var messageEl = document.createElement('div');")
+    parts.append("    messageEl.className = 'toast-message';")
+    parts.append("    messageEl.textContent = message;")
+    parts.append("    content.appendChild(messageEl);")
+    parts.append("    ")
+    parts.append("    var closeBtn = document.createElement('div');")
+    parts.append("    closeBtn.className = 'toast-close';")
+    parts.append("    closeBtn.textContent = '×';")
+    parts.append("    closeBtn.onclick = function() { removeToast(toast); };")
+    parts.append("    ")
+    parts.append("    toast.appendChild(icon);")
+    parts.append("    toast.appendChild(content);")
+    parts.append("    toast.appendChild(closeBtn);")
+    parts.append("    ")
+    parts.append("    container.appendChild(toast);")
+    parts.append("    ")
+    parts.append("    if (duration > 0) {")
+    parts.append("      setTimeout(function() { removeToast(toast); }, duration);")
+    parts.append("    }")
+    parts.append("    ")
+    parts.append("    return toast;")
+    parts.append("  };")
+    parts.append("  ")
+    parts.append("  function removeToast(toast) {")
+    parts.append("    toast.classList.add('removing');")
+    parts.append("    setTimeout(function() {")
+    parts.append("      if (toast.parentNode) toast.parentNode.removeChild(toast);")
+    parts.append("    }, 300);")
+    parts.append("  }")
+    parts.append("  ")
+    parts.append("  // Enhanced XHR wrapper with automatic toast notifications")
+    parts.append("  window.xhrWithToast = function(method, url, data, options) {")
+    parts.append("    options = options || {};")
+    parts.append("    var onSuccess = options.onSuccess;")
+    parts.append("    var onError = options.onError;")
+    parts.append("    var successMessage = options.successMessage;")
+    parts.append("    var errorMessage = options.errorMessage;")
+    parts.append("    var showSuccessToast = options.showSuccessToast !== false;")
+    parts.append("    var showErrorToast = options.showErrorToast !== false;")
+    parts.append("    ")
+    parts.append("    xhr(method, url, data, function(status, response) {")
+    parts.append("      if (status >= 200 && status < 300) {")
+    parts.append("        if (showSuccessToast && successMessage) {")
+    parts.append("          showToast(successMessage, 'success');")
+    parts.append("        }")
+    parts.append("        if (onSuccess) onSuccess(response);")
+    parts.append("      } else {")
+    parts.append("        var errMsg = errorMessage || 'Request failed';")
+    parts.append("        if (response && response.detail) {")
+    parts.append("          if (typeof response.detail === 'object' && response.detail.error) {")
+    parts.append("            errMsg = response.detail.error;")
+    parts.append("          } else if (typeof response.detail === 'string') {")
+    parts.append("            errMsg = response.detail;")
+    parts.append("          }")
+    parts.append("        }")
+    parts.append("        if (showErrorToast) {")
+    parts.append("          showToast(errMsg, 'error', 'Error');")
+    parts.append("        }")
+    parts.append("        if (onError) onError(response, status);")
+    parts.append("      }")
+    parts.append("    });")
+    parts.append("  };")
+    parts.append("})();")
+    parts.append("")
+
     # Render apps
     parts.append("function renderApps() {")
     parts.append("  var container = document.getElementById('app-list');")
