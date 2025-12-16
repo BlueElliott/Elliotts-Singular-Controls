@@ -430,15 +430,21 @@ class SingularTweaksGUI:
         )
         self.hide_btn.pack(side=tk.LEFT, padx=6)
 
-        # Row 3 (Quit centered or full width)
+        # Row 3 (Update and Quit)
         row3 = tk.Frame(btn_container, bg=self.bg_dark)
         row3.pack(pady=6)
 
+        self.update_btn = self.create_rounded_button(
+            row3, "Check for Updates", self.check_for_updates,
+            self.accent_teal, width=290, height=50
+        )
+        self.update_btn.pack(side=tk.LEFT, padx=6)
+
         self.quit_btn = self.create_rounded_button(
             row3, "Quit Server", self.on_closing,
-            self.button_red_dark, width=596, height=50
+            self.button_red_dark, width=290, height=50
         )
-        self.quit_btn.pack()
+        self.quit_btn.pack(side=tk.LEFT, padx=6)
 
         # Start pulse animation and runtime update
         self._update_pulse()
@@ -871,6 +877,142 @@ class SingularTweaksGUI:
         if self.icon:
             self.icon.stop()
             self.icon = None
+
+    def check_for_updates(self):
+        """Check for updates and prompt to install if available."""
+        from elliotts_singular_controls import updater
+
+        # Disable button and show checking status
+        self.update_btn.button_state = tk.DISABLED
+        self._update_button_text(self.update_btn, "Checking...")
+
+        def do_check():
+            try:
+                update_info = updater.check_for_updates()
+
+                if update_info:
+                    # Update available
+                    version = update_info['version']
+                    self.root.after(0, lambda: self._show_update_available(update_info))
+                else:
+                    # No update available
+                    self.root.after(0, lambda: self._show_no_update())
+            except Exception as e:
+                logger.error(f"Error checking for updates: {e}")
+                self.root.after(0, lambda: self._show_update_error(str(e)))
+
+        # Run check in background thread
+        import threading
+        threading.Thread(target=do_check, daemon=True).start()
+
+    def _update_button_text(self, button_canvas, new_text):
+        """Update the text on a button canvas."""
+        button_canvas.delete("all")
+        width = button_canvas.winfo_width() or 290
+        height = button_canvas.winfo_height() or 50
+        radius = 10
+        self._draw_smooth_rounded_rect(button_canvas, 0, 0, width, height, radius, button_canvas.bg_color)
+        button_canvas.create_text(
+            width/2, height/2,
+            text=new_text,
+            fill=self.text_light if button_canvas.button_state == tk.NORMAL else self.text_gray,
+            font=self.font_bold_11
+        )
+
+    def _show_update_available(self, update_info):
+        """Show that an update is available and offer to install."""
+        version = update_info['version']
+        logger.info(f"Update available: v{version}")
+
+        # Update button to show install option
+        self.update_btn.button_state = tk.NORMAL
+        self._update_button_text(self.update_btn, f"Install v{version}")
+
+        # Rebind to install instead of check
+        self.update_btn.unbind("<Button-1>")
+        self.update_btn.bind("<Button-1>", lambda e: self._install_update(update_info))
+
+        self.status_label.config(text=f"Update available: v{version}")
+
+    def _show_no_update(self):
+        """Show that no update is available."""
+        logger.info("No updates available")
+        self.update_btn.button_state = tk.NORMAL
+        self._update_button_text(self.update_btn, "Up to date ✓")
+
+        # Reset after 3 seconds
+        self.root.after(3000, lambda: self._reset_update_button())
+
+    def _show_update_error(self, error):
+        """Show update check error."""
+        logger.error(f"Update check failed: {error}")
+        self.update_btn.button_state = tk.NORMAL
+        self._update_button_text(self.update_btn, "Check Failed")
+
+        # Reset after 3 seconds
+        self.root.after(3000, lambda: self._reset_update_button())
+
+    def _reset_update_button(self):
+        """Reset update button to original state."""
+        self.update_btn.button_state = tk.NORMAL
+        self._update_button_text(self.update_btn, "Check for Updates")
+        self.update_btn.unbind("<Button-1>")
+        self.update_btn.bind("<Button-1>", lambda e: self.check_for_updates())
+
+    def _install_update(self, update_info):
+        """Download and install the update."""
+        from elliotts_singular_controls import updater
+
+        # Disable button and show downloading status
+        self.update_btn.button_state = tk.DISABLED
+        self._update_button_text(self.update_btn, "Downloading...")
+        self.status_label.config(text="Downloading update...")
+
+        def do_download():
+            try:
+                download_url = update_info['download_url']
+                asset_name = update_info['asset_name']
+
+                # Download
+                new_exe = updater.download_update(download_url, asset_name)
+
+                if new_exe:
+                    self.root.after(0, lambda: self._finish_update(new_exe))
+                else:
+                    self.root.after(0, lambda: self._show_download_error())
+            except Exception as e:
+                logger.error(f"Error downloading update: {e}")
+                self.root.after(0, lambda: self._show_download_error())
+
+        # Run download in background thread
+        import threading
+        threading.Thread(target=do_download, daemon=True).start()
+
+    def _finish_update(self, new_exe_path):
+        """Finish the update process."""
+        from elliotts_singular_controls import updater
+
+        self.status_label.config(text="Installing update...")
+        self._update_button_text(self.update_btn, "Installing...")
+
+        # Install the update (this will restart the app)
+        success = updater.install_update(new_exe_path)
+
+        if success:
+            # The updater will restart the app
+            self.quit_app()
+        else:
+            self._show_download_error()
+
+    def _show_download_error(self):
+        """Show download/install error."""
+        logger.error("Update download/install failed")
+        self.update_btn.button_state = tk.NORMAL
+        self._update_button_text(self.update_btn, "Install Failed")
+        self.status_label.config(text="Update failed")
+
+        # Reset after 3 seconds
+        self.root.after(3000, lambda: self._reset_update_button())
 
     def on_closing(self):
         """Handle window close event."""
