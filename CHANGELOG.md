@@ -30,22 +30,101 @@
 | v1.0.14 | 2025-11-22 | Major Rebrand |
 | v1.0.15 | 2025-11-23 | Bug Fix |
 | v1.1.0 | 2025-11-23 | Major Update |
+| v1.1.1 | 2025-11-29 | Feature Update |
+| v1.1.2 | N/A | On Hold |
+| v1.1.3 | 2025-12-16 | Feature Update |
+| v1.1.4 | 2025-12-16 | Bug Fix |
+| v1.1.5 | 2025-12-16 | Feature Update |
 
 ---
 
 ## Detailed Changelog
 
-### 2025-11-23 (Today)
+### 2025-12-16
 
-#### Unreleased - TriCaster Module (WIP)
-- `7b026fc` - Add TriCaster module with DDR-to-Singular timer sync (WIP)
-  - TriCaster connection settings (host, user, password)
-  - DDR-to-Singular timer sync functionality
-  - Read DDR durations from TriCaster API
-  - Sync durations to Singular timer controls
-  - Frame-accurate rounding option
-  - Timer controls: Start, Pause, Reset, Restart
-  - Configurable field mappings for 4 DDRs
+#### v1.1.5 - CasparCG Control Module
+- `3bbc41c` - Add CasparCG control module (v1.1.5)
+  - AMCP protocol integration for CasparCG Server
+  - Graphics template control (CG ADD, CG PLAY, CG STOP, CG REMOVE)
+  - Media playback control (PLAY, STOP, PAUSE)
+  - Channel and layer management
+  - Server connection monitoring
+  - Standalone control page at `/casparcg/control`
+  - Configuration settings (host, port)
+  - Test connection functionality
+
+#### v1.1.4 - TfL Fixes & Cuez Shortcuts
+- `acee540` - Fix TfL standalone page input color changes and add Cuez keyboard shortcuts (v1.1.4)
+  - Fixed TfL standalone page input background color changes
+  - Input fields now correctly turn red for non-"Good Service" status
+  - Added keyboard shortcuts for Cuez Automator navigation
+  - Improved operator efficiency with quick controls
+
+#### v1.1.3 - Counter Control & UI Unification
+- `e1c12ce` - Add Singular counter control and unified button UI (v1.1.3)
+  - Singular counter field control functionality
+  - Increment/decrement operations
+  - Reset functionality
+  - Direct value setting
+  - Unified button styling across all modules
+  - Consistent UI design and spacing
+
+#### Repository Maintenance
+- `3fb54dd` - Tidy repository and update .gitignore
+- `04d4685` - Move Cuez-to-CueiT Bridge to future_projects (on hold)
+
+---
+
+### 2025-11-29
+
+#### v1.1.2 (Not Released - On Hold)
+- `69f9a05` - Update SESSION_SUMMARY.md and version to 1.1.2
+- `45755e1` - Add Cuez-to-CueiT Bridge module for automatic script synchronization
+  - Complete implementation of automatic script sync from Cuez to CueiT
+  - File-based approach with RTF/TXT format support
+  - Background worker with configurable polling (1-30s)
+  - MD5 hash-based change detection
+  - Standalone control page at `/cuez-to-cueit/control`
+  - **Status: On hold due to file-based sync reliability concerns**
+
+#### v1.1.1 - Major Feature Release
+- `0c014aa` - Update SESSION_SUMMARY.md with v1.1.2 features
+- `99d019d` - Add Cuez Automator and iNews Cleaner modules, dynamic network IP display
+  - **Cuez Automator Module:**
+    - Full integration with Cuez Automator HTTP API
+    - Button control (fire, set ON/OFF states)
+    - Macro execution
+    - Navigation controls (next/previous item and trigger)
+    - Rundown content viewing (items and blocks)
+    - Trigger specific blocks by ID
+    - Standalone control page at `/cuez/control`
+    - Click-to-copy UUIDs for automation
+  - **iNews Cleaner Module:**
+    - Remove formatting grommets from iNews exports
+    - Regex pattern matching for grommet removal
+    - Two-column layout (input/output)
+    - Copy output to clipboard
+    - Standalone page at `/inews/control`
+  - **Dynamic Network IP Display:**
+    - Smart URL detection based on access method
+    - Desktop GUI shows clickable network IP
+    - All HTTP command URLs adapt to access method
+- `9c63caa` - Add TriCaster auto-sync and UI improvements (v1.1.1)
+  - **TriCaster Module:**
+    - TriCaster connection settings (host, user, password)
+    - DDR-to-Singular timer sync functionality
+    - Read DDR durations from TriCaster API
+    - Sync durations to Singular timer controls
+    - Frame-accurate rounding option
+    - Timer controls: Start, Pause, Reset, Restart
+    - Configurable field mappings for 4 DDRs
+    - Auto-sync feature with configurable intervals (2-10s)
+    - Smart change detection to prevent unnecessary syncs
+    - HTTP Command URLs for external triggering
+
+---
+
+### 2025-11-23
 
 #### v1.1.0 - UI Polish & Smooth Pulse Indicator
 - `753664a` - Release v1.1.0 - UI polish and smooth pulse indicator
@@ -251,18 +330,32 @@
 - UI alignment fixes
 - Comprehensive documentation
 
-### Unreleased (WIP)
+### v1.1.5
+- CasparCG control module
+- AMCP protocol integration
+- Template and media control
+
+### v1.1.4
+- TfL standalone page fixes
+- Cuez keyboard shortcuts
+
+### v1.1.3
+- Singular counter control
+- Unified button UI
+
+### v1.1.1
 - TriCaster module
-- DDR-to-Singular timer sync
-- Frame-accurate duration sync
+- Cuez Automator integration
+- iNews Cleaner
+- Dynamic network IP display
 
 ---
 
 ## Statistics
 
-- **Total Commits:** 46
-- **Total Releases:** 17
-- **Development Period:** 2025-11-10 to present (14 days)
+- **Total Commits:** 51+
+- **Total Releases:** 20 (v1.1.2 on hold)
+- **Development Period:** 2025-11-10 to 2025-12-16 (36 days)
 - **Major Versions:** 2 (v1.0.x, v1.1.x)
 
 ---

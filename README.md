@@ -13,6 +13,10 @@ A helper UI and HTTP API that makes it easy to control Singular.live composition
 - **Web-based Control Panel** - Configure and test your Singular compositions
 - **Simple HTTP API** - Trigger compositions with GET requests
 - **TfL Integration** - Fetch and display London transport statuses with official branding
+- **TriCaster Control** - DDR-to-Singular timer sync with auto-sync
+- **Cuez Automator** - Full rundown control, navigation, and macro execution
+- **CasparCG Control** - Complete AMCP protocol integration for graphics and media
+- **iNews Cleaner** - Remove formatting grommets from iNews exports
 - **Data Stream Support** - Send data to Singular's Data Stream
 - **Multi-Token Support** - Manage multiple Singular Control App tokens
 - **Desktop GUI** - Native Windows application with system tray support
@@ -23,7 +27,7 @@ A helper UI and HTTP API that makes it easy to control Singular.live composition
 ### Windows (Recommended)
 
 **Portable Executable (Easiest)**
-1. Download `ElliottsSingularControls-1.1.0.exe` from [Releases](https://github.com/BlueElliott/Elliotts-Singular-Controls/releases)
+1. Download `ElliottsSingularControls.exe` from [Releases](https://github.com/BlueElliott/Elliotts-Singular-Controls/releases)
 2. Double-click to run - no installation needed!
 3. The application runs from the system tray
 
@@ -217,17 +221,34 @@ Elliotts-Singular-Controls/
 
 ```bash
 pyinstaller ElliottsSingularControls.spec
-# Output: dist/ElliottsSingularControls-1.1.0.exe
+# Output: dist/ElliottsSingularControls-1.1.5.exe
 ```
 
 ## Version History
 
-### v1.1.0 (Current)
+### v1.1.5 (Current)
+- CasparCG control module with AMCP protocol support
+- Complete graphics template and media playback control
+- Standalone CasparCG control page
+
+### v1.1.4
+- Fixed TfL standalone page input color changes
+- Added Cuez keyboard shortcuts for navigation
+
+### v1.1.3
+- Singular counter control functionality
+- Unified button UI across all modules
+
+### v1.1.1
+- TriCaster module with DDR-to-Singular timer sync
+- Auto-sync feature with smart change detection
+- Cuez Automator full integration
+- iNews Cleaner module
+
+### v1.1.0
 - Improved desktop GUI with smooth animated pulse indicator
 - Fixed TfL manual input background color on modules page
 - Enhanced UI consistency across all pages
-- Removed visual artifacts from rounded rectangles
-- Anti-aliased graphics using PIL rendering
 
 ### v1.0.x
 - Initial release with core functionality

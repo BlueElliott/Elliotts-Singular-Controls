@@ -2,14 +2,93 @@
 
 ## Project Overview
 **Name:** Elliott's Singular Controls (formerly Singular Tweaks)
-**Version:** 1.1.2 (in development)
+**Version:** 1.1.5
 **Repository:** https://github.com/BlueElliott/Elliotts-Singular-Controls
 
-A premium desktop application for controlling Singular.live graphics with TfL, TriCaster, Cuez Automator, and iNews integration.
+A premium desktop application for controlling Singular.live graphics with TfL, TriCaster, Cuez Automator, CasparCG, and iNews integration.
 
 ---
 
-## What's New in v1.1.2 (In Development)
+## What's New in v1.1.5
+
+### CasparCG Control Module
+
+1. **Complete CasparCG Integration**
+   - Connect to CasparCG Server via AMCP protocol
+   - Control graphics templates and media playback
+   - Full channel and layer management
+   - Real-time server status monitoring
+
+2. **Features**
+   - Play/stop/pause media on any channel/layer
+   - Template control (CG ADD, CG PLAY, CG STOP, CG REMOVE)
+   - AMCP command execution
+   - Server connection management
+   - Standalone control page at `/casparcg/control`
+
+3. **Configuration**
+   - `enable_casparcg` - Module toggle
+   - `casparcg_host` - CasparCG server IP/hostname
+   - `casparcg_port` - AMCP port (default: 5250)
+
+4. **API Endpoints**
+   ```
+   POST /config/module/casparcg   - Enable/disable module
+   POST /config/casparcg           - Save connection settings
+   GET  /casparcg/test             - Test connection
+   POST /casparcg/command          - Execute AMCP command
+   GET  /casparcg/control          - Standalone control page
+   ```
+
+---
+
+## What's in v1.1.4
+
+### TfL Standalone Page Improvements
+
+1. **Input Color Change Fix**
+   - Fixed background color changes on TfL standalone page
+   - Input fields now correctly turn red for non-"Good Service" status
+   - Consistent behavior with modules page
+
+### Cuez Keyboard Shortcuts
+
+1. **Navigation Shortcuts**
+   - Added keyboard shortcuts for Cuez navigation
+   - Quick access to common controls
+   - Improved operator efficiency
+
+---
+
+## What's in v1.1.3
+
+### Singular Counter Control
+
+1. **Counter Management**
+   - Control Singular counter fields
+   - Increment/decrement operations
+   - Reset functionality
+   - Direct value setting
+
+### Unified Button UI
+
+1. **Consistent Button Design**
+   - Standardized button styling across all modules
+   - Improved visual consistency
+   - Better user experience
+   - Unified color scheme and spacing
+
+---
+
+## What's in v1.1.2 (Cuez-to-CueiT Bridge - On Hold)
+
+The Cuez-to-CueiT Bridge module was developed but put on hold due to potential issues with the file-based sync method. See [future_projects/cuez_to_cueit_bridge.md](future_projects/cuez_to_cueit_bridge.md) for full details.
+
+**Reason for Hold:** File-based synchronization reliability concerns need investigation before release.
+
+---
+
+## What's in v1.1.1
 
 ### Cuez Automator Module - Full Integration
 
@@ -165,8 +244,6 @@ A premium desktop application for controlling Singular.live graphics with TfL, T
    - Fixed iNews POST endpoint parameter handling
 
 ---
-
-## What's in v1.1.1
 
 ### TriCaster Module - Full Implementation
 
@@ -482,7 +559,23 @@ When running locally on port 3113:
 
 ## Version History
 
-### v1.1.1 (Current)
+### v1.1.5 (Current)
+- CasparCG control module with AMCP protocol support
+- Complete graphics template and media control
+- Standalone CasparCG control page
+
+### v1.1.4
+- Fixed TfL standalone page input color changes
+- Added Cuez keyboard shortcuts for navigation
+
+### v1.1.3
+- Singular counter control functionality
+- Unified button UI across all modules
+
+### v1.1.2 (Not Released - On Hold)
+- Cuez-to-CueiT Bridge development (moved to future_projects)
+
+### v1.1.1
 - TriCaster module with DDR-to-Singular timer sync
 - Auto-sync feature with smart change detection
 - HTTP Command URLs section (collapsible, click-to-copy)
