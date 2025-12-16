@@ -27,6 +27,9 @@ except:
 # Import needed functions
 from elliotts_singular_controls.core import effective_port, _runtime_version
 
+# Configure logging
+logger = logging.getLogger(__name__)
+
 
 def is_port_in_use(port: int) -> bool:
     """Check if a port is already in use."""
