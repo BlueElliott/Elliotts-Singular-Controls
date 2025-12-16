@@ -1828,6 +1828,24 @@ def _base_style() -> str:
     lines.append(f"  .toast-close:hover {{ color: {fg}; }}")
     lines.append(f"  @keyframes slideIn {{ from {{ opacity: 0; transform: translateX(400px); }} to {{ opacity: 1; transform: translateX(0); }} }}")
 
+    # Update notification banner
+    lines.append(f"  /* Update Notification Banner */")
+    lines.append(f"  #update-banner {{ position: fixed; top: 0; left: 0; right: 0; z-index: 10000; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); "
+                 f"color: #fff; padding: 12px 20px; display: none; align-items: center; justify-content: center; gap: 16px; "
+                 f"box-shadow: 0 4px 12px rgba(0,0,0,0.3); animation: slideDown 0.3s ease-out; }}")
+    lines.append(f"  #update-banner.show {{ display: flex; }}")
+    lines.append(f"  .update-content {{ display: flex; align-items: center; gap: 12px; flex: 1; justify-content: center; }}")
+    lines.append(f"  .update-icon {{ font-size: 24px; }}")
+    lines.append(f"  .update-text {{ font-size: 14px; font-weight: 500; }}")
+    lines.append(f"  .update-text strong {{ font-weight: 700; }}")
+    lines.append(f"  .update-btn {{ background: rgba(255,255,255,0.2); color: #fff; padding: 8px 20px; border-radius: 6px; "
+                 f"text-decoration: none; font-size: 13px; font-weight: 600; transition: all 0.2s; border: 1px solid rgba(255,255,255,0.3); }}")
+    lines.append(f"  .update-btn:hover {{ background: rgba(255,255,255,0.3); transform: translateY(-1px); }}")
+    lines.append(f"  .update-close {{ cursor: pointer; font-size: 24px; padding: 4px 8px; opacity: 0.8; transition: opacity 0.2s; }}")
+    lines.append(f"  .update-close:hover {{ opacity: 1; }}")
+    lines.append(f"  @keyframes slideDown {{ from {{ transform: translateY(-100%); }} to {{ transform: translateY(0); }} }}")
+    lines.append(f"  body.has-update-banner {{ padding-top: 48px; }}")
+
     lines.append("</style>")
     return "\n".join(lines)
 
@@ -2681,7 +2699,7 @@ def check_version():
     try:
         resp = safe_http_request(
             "GET",
-            "https://api.github.com/repos/BlueElliott/Singular-Tweaks/releases/latest",
+            "https://api.github.com/repos/BlueElliott/Elliotts-Singular-Controls/releases/latest",
             module="version_check",
             context="Checking for updates",
             timeout=5
@@ -3267,6 +3285,15 @@ def index():
     parts.append("  .add-app-form button { height: 32px; margin: 0 !important; }")
     parts.append("</style>")
     parts.append("</head><body>")
+    # Update notification banner
+    parts.append('<div id="update-banner">')
+    parts.append('  <div class="update-content">')
+    parts.append('    <div class="update-icon">🎉</div>')
+    parts.append('    <div class="update-text">A new version is available: <strong id="update-version"></strong></div>')
+    parts.append('    <a href="#" id="update-btn" class="update-btn" target="_blank">Download Update</a>')
+    parts.append('  </div>')
+    parts.append('  <div class="update-close" onclick="dismissUpdate()">×</div>')
+    parts.append('</div>')
     parts.append(_nav_html("Home"))
     parts.append("<h1>Elliott's Singular Controls</h1>")
     parts.append("<p>Mainly used to send <strong>GET</strong> and simple HTTP commands to your Singular Control App.</p>")
@@ -3531,6 +3558,32 @@ def index():
     # Load data immediately
     parts.append("loadConfig(pingAll);")
     parts.append("loadEvents();")
+    parts.append("")
+    # Version check and update notification
+    parts.append("// Version check and update notification")
+    parts.append("function checkForUpdates() {")
+    parts.append("  xhr('GET', '/version/check', null, function(status, response) {")
+    parts.append("    if (status === 200 && response && !response.up_to_date) {")
+    parts.append("      var dismissedVersion = localStorage.getItem('dismissedUpdate');")
+    parts.append("      if (dismissedVersion !== response.latest) {")
+    parts.append("        document.getElementById('update-version').textContent = response.latest;")
+    parts.append("        document.getElementById('update-btn').href = response.release_url;")
+    parts.append("        document.getElementById('update-banner').classList.add('show');")
+    parts.append("        document.body.classList.add('has-update-banner');")
+    parts.append("      }")
+    parts.append("    }")
+    parts.append("  });")
+    parts.append("}")
+    parts.append("")
+    parts.append("function dismissUpdate() {")
+    parts.append("  var version = document.getElementById('update-version').textContent;")
+    parts.append("  localStorage.setItem('dismissedUpdate', version);")
+    parts.append("  document.getElementById('update-banner').classList.remove('show');")
+    parts.append("  document.body.classList.remove('has-update-banner');")
+    parts.append("}")
+    parts.append("")
+    parts.append("// Check for updates on page load")
+    parts.append("checkForUpdates();")
     parts.append("</script>")
     parts.append("</body></html>")
     return HTMLResponse("".join(parts))
